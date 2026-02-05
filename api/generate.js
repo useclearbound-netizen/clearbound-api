@@ -5,7 +5,9 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
     const { state } = req.body || {};
@@ -15,26 +17,43 @@ export default async function handler(req, res) {
 
     const required = ["relationship", "target", "intent", "tone", "format", "context"];
     const missing = required.filter((k) => !(k in state));
-    if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(", ")}` });
+    if (missing.length) {
+      return res.status(400).json({ error: `Missing fields: ${missing.join(", ")}` });
+    }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const PROMPTS_REPO = process.env.PROMPTS_REPO;
     const PROMPTS_REF = process.env.PROMPTS_REF || "main";
 
-    if (!OPENAI_API_KEY) return res.status(500).json({ error: "Server misconfig: OPENAI_API_KEY missing" });
-    if (!PROMPTS_REPO) return res.status(500).json({ error: "Server misconfig: PROMPTS_REPO missing" });
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "Server misconfig: OPENAI_API_KEY missing" });
+    }
+    if (!PROMPTS_REPO) {
+      return res.status(500).json({ error: "Server misconfig: PROMPTS_REPO missing" });
+    }
 
-    const ghRaw = (path) => `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
+    const ghRaw = (path) =>
+      `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
     async function fetchText(url) {
       const r = await fetch(url);
-      if (!r.ok) throw new Error(`Prompt fetch failed ${r.status}: ${url}`);
+      if (!r.ok) {
+        throw new Error(`Prompt fetch failed ${r.status}: ${url}`);
+      }
       return await r.text();
     }
 
-    const toneId = String(state.tone).toLowerCase();
-    const formatId = String(state.format).toLowerCase();
-    const intentId = String(state.intent).toLowerCase();
+    /* ✅ 핵심 수정: value에서 ID 추출 */
+    const toneId = String(state.tone?.value || "").toLowerCase();
+    const formatId = String(state.format?.value || "").toLowerCase();
+    const intentId = String(state.intent?.value || "").toLowerCase();
+
+    if (!toneId || !formatId || !intentId) {
+      return res.status(400).json({
+        error: "Invalid tone / format / intent value",
+        details: { toneId, formatId, intentId },
+      });
+    }
 
     const [
       tonePrompt,
@@ -88,13 +107,20 @@ export default async function handler(req, res) {
     });
 
     const data = await resp.json();
-    if (!resp.ok) return res.status(500).json({ error: "OpenAI failed", details: data });
+    if (!resp.ok) {
+      return res.status(500).json({ error: "OpenAI failed", details: data });
+    }
 
     const resultText = data?.output_text || "";
-    if (!resultText.trim()) return res.status(500).json({ error: "Empty result" });
+    if (!resultText.trim()) {
+      return res.status(500).json({ error: "Empty result" });
+    }
 
     return res.status(200).json({ result_text: resultText.trim() });
   } catch (e) {
-    return res.status(500).json({ error: "Server error", details: String(e?.message || e) });
+    return res.status(500).json({
+      error: "Server error",
+      details: String(e?.message || e),
+    });
   }
 }
