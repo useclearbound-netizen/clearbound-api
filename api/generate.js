@@ -3,9 +3,11 @@
 // - Adds in-memory prompt caching (TTL default 10m)
 // - Improves upstream error visibility + safe parsing
 // - Optional OpenAI retry (1x) for transient failures
+// ✅ v1.1: adds relationship pack loading + validation
 
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const promptCache = globalThis.__CB_PROMPT_CACHE__ || (globalThis.__CB_PROMPT_CACHE__ = new Map());
+const promptCache =
+  globalThis.__CB_PROMPT_CACHE__ || (globalThis.__CB_PROMPT_CACHE__ = new Map());
 
 function now() {
   return Date.now();
@@ -69,7 +71,9 @@ function safeJsonParse(text) {
 
 function extractOutputText(data) {
   // Prefer the convenience field if present
-  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
 
   // Otherwise attempt to extract from structured output (Responses API)
   const out = data?.output;
@@ -113,7 +117,6 @@ async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
   // Retry once on likely transient errors
   const transient = [408, 429, 500, 502, 503, 504].includes(r1.status);
   if (retryOnce && transient) {
-    // small backoff (no sleep dependency needed)
     await new Promise((resolve) => setTimeout(resolve, 250));
     const r2 = await attempt();
     return r2;
@@ -130,7 +133,8 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return jsonFail(res, 405, "method", { error: "Method not allowed" });
+  if (req.method !== "POST")
+    return jsonFail(res, 405, "method", { error: "Method not allowed" });
 
   // Small helper for stageful errors
   const fail = (status, stage, extra = {}) => jsonFail(res, status, stage, extra);
@@ -159,12 +163,31 @@ export default async function handler(req, res) {
     if (!PROMPTS_REPO) return fail(500, "env", { error: "PROMPTS_REPO missing" });
 
     // Cache TTL (ms)
-    const ttlMs = Number(pickEnv("PROMPT_CACHE_TTL_MS", String(DEFAULT_CACHE_TTL_MS))) || DEFAULT_CACHE_TTL_MS;
+    const ttlMs =
+      Number(pickEnv("PROMPT_CACHE_TTL_MS", String(DEFAULT_CACHE_TTL_MS))) ||
+      DEFAULT_CACHE_TTL_MS;
 
     // Inputs
+    const relationshipId = asLowerId(state.relationship?.value);
     const toneId = asLowerId(state.tone?.value);
     const formatId = asLowerId(state.format?.value);
     const intentId = asLowerId(state.intent?.value);
+
+    // Validate IDs
+    const allowedRelationships = new Set([
+      "family",
+      "friends_personal",
+      "work_professional",
+      "living_proximity",
+      "orgs_services",
+    ]);
+
+    if (!relationshipId || !allowedRelationships.has(relationshipId)) {
+      return fail(400, "validate_ids", {
+        error: "Invalid relationship value",
+        details: { relationshipId },
+      });
+    }
 
     if (!toneId || !formatId || !intentId) {
       return fail(400, "validate_ids", {
@@ -174,10 +197,12 @@ export default async function handler(req, res) {
     }
 
     // GitHub raw URLs
-    const ghRaw = (path) => `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
+    const ghRaw = (path) =>
+      `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
-    // Prompt paths
+    // Prompt paths (ORDER MATTERS for Object.entries traversal)
     const promptPaths = {
+      relationship: `relationship/relationship.${relationshipId}.v1.md`, // ✅ NEW
       tone: `tone/tone.${toneId}.v1.md`,
       format: `format/format.${formatId}.v1.md`,
       intent: `intent/intent.${intentId}.v1.md`,
@@ -187,9 +212,17 @@ export default async function handler(req, res) {
     };
 
     // Fetch prompts (cached)
-    let tonePrompt, formatPrompt, intentPrompt, normalizePrompt, targetRulesPrompt, assemblePrompt;
+    let relationshipPrompt,
+      tonePrompt,
+      formatPrompt,
+      intentPrompt,
+      normalizePrompt,
+      targetRulesPrompt,
+      assemblePrompt;
+
     try {
       [
+        relationshipPrompt,
         tonePrompt,
         formatPrompt,
         intentPrompt,
@@ -208,8 +241,12 @@ export default async function handler(req, res) {
     }
 
     // System + user
+    // Assemble order (LOCK):
+    // relationship → tone → format → intent → normalize → target_rules → assemble
     const system = [
       "Return ONLY the final message.",
+      "",
+      relationshipPrompt,
       "",
       tonePrompt,
       "",
