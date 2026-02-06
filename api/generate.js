@@ -9,16 +9,20 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // 작은 헬퍼: 에러를 단계별로 식별
+  const fail = (status, stage, extra = {}) =>
+    res.status(status).json({ ok: false, stage, ...extra });
+
   try {
     const { state } = req.body || {};
     if (!state || typeof state !== "object") {
-      return res.status(400).json({ error: "Missing or invalid `state` object" });
+      return fail(400, "validate_body", { error: "Missing or invalid `state` object" });
     }
 
     const required = ["relationship", "target", "intent", "tone", "format", "context"];
     const missing = required.filter((k) => !(k in state));
     if (missing.length) {
-      return res.status(400).json({ error: `Missing fields: ${missing.join(", ")}` });
+      return fail(400, "validate_state", { error: `Missing fields: ${missing.join(", ")}` });
     }
 
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -26,50 +30,56 @@ export default async function handler(req, res) {
     const PROMPTS_REF = process.env.PROMPTS_REF || "main";
 
     if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "Server misconfig: OPENAI_API_KEY missing" });
+      return fail(500, "env", { error: "OPENAI_API_KEY missing" });
     }
     if (!PROMPTS_REPO) {
-      return res.status(500).json({ error: "Server misconfig: PROMPTS_REPO missing" });
+      return fail(500, "env", { error: "PROMPTS_REPO missing" });
     }
 
     const ghRaw = (path) =>
       `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
-    async function fetchText(url) {
+    async function fetchText(url, label) {
       const r = await fetch(url);
+      const text = await r.text().catch(() => "");
       if (!r.ok) {
-        throw new Error(`Prompt fetch failed ${r.status}: ${url}`);
+        // 어디 파일이 터졌는지 바로 노출
+        throw new Error(`PROMPT_FETCH_FAIL:${label}:${r.status}:${url}:${text.slice(0, 200)}`);
       }
-      return await r.text();
+      return text;
     }
 
-    /* ✅ 핵심 수정: value에서 ID 추출 */
     const toneId = String(state.tone?.value || "").toLowerCase();
     const formatId = String(state.format?.value || "").toLowerCase();
     const intentId = String(state.intent?.value || "").toLowerCase();
 
     if (!toneId || !formatId || !intentId) {
-      return res.status(400).json({
+      return fail(400, "validate_ids", {
         error: "Invalid tone / format / intent value",
         details: { toneId, formatId, intentId },
       });
     }
 
-    const [
-      tonePrompt,
-      formatPrompt,
-      intentPrompt,
-      normalizePrompt,
-      targetRulesPrompt,
-      assemblePrompt,
-    ] = await Promise.all([
-      fetchText(ghRaw(`tone/tone.${toneId}.v1.md`)),
-      fetchText(ghRaw(`format/format.${formatId}.v1.md`)),
-      fetchText(ghRaw(`intent/intent.${intentId}.v1.md`)),
-      fetchText(ghRaw(`rules/context.normalize.v1.md`)),
-      fetchText(ghRaw(`rules/target.rules.v1.md`)),
-      fetchText(ghRaw(`assemble/assemble.generate.v1.md`)),
-    ]);
+    let tonePrompt, formatPrompt, intentPrompt, normalizePrompt, targetRulesPrompt, assemblePrompt;
+    try {
+      [
+        tonePrompt,
+        formatPrompt,
+        intentPrompt,
+        normalizePrompt,
+        targetRulesPrompt,
+        assemblePrompt,
+      ] = await Promise.all([
+        fetchText(ghRaw(`tone/tone.${toneId}.v1.md`), "tone"),
+        fetchText(ghRaw(`format/format.${formatId}.v1.md`), "format"),
+        fetchText(ghRaw(`intent/intent.${intentId}.v1.md`), "intent"),
+        fetchText(ghRaw(`rules/context.normalize.v1.md`), "normalize"),
+        fetchText(ghRaw(`rules/target.rules.v1.md`), "target_rules"),
+        fetchText(ghRaw(`assemble/assemble.generate.v1.md`), "assemble"),
+      ]);
+    } catch (e) {
+      return fail(502, "prompt_fetch", { error: String(e?.message || e) });
+    }
 
     const system = [
       "Return ONLY the final message.",
@@ -106,19 +116,21 @@ export default async function handler(req, res) {
       }),
     });
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => null);
     if (!resp.ok) {
-      return res.status(500).json({ error: "OpenAI failed", details: data });
+      return fail(502, "openai", { error: "OpenAI failed", details: data });
     }
 
     const resultText = data?.output_text || "";
     if (!resultText.trim()) {
-      return res.status(500).json({ error: "Empty result" });
+      return fail(502, "openai_output", { error: "Empty result", details: data });
     }
 
-    return res.status(200).json({ result_text: resultText.trim() });
+    return res.status(200).json({ ok: true, result_text: resultText.trim() });
   } catch (e) {
     return res.status(500).json({
+      ok: false,
+      stage: "server_error",
       error: "Server error",
       details: String(e?.message || e),
     });
