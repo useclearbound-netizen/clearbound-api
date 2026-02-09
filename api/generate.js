@@ -1,16 +1,10 @@
 // /api/generate.js
-// ClearBound — Vercel Serverless API (v1 service baseline)
-// ✅ Updated to accept vNext frontend state schema (relationship_axis / risk_scan / context_builder / intent / tone / depth / paywall / format)
-// ✅ Wires prompt loading to clearbound-vnext repo structure:
-//    prompts/normalize/normalize_state_to_canonical.prompt.md
-//    prompts/intent/<intent>.prompt.md
-//    prompts/assemble/assemble_generate.prompt.md
-//    prompts/output/{message,email,analysis_report}.prompt.md
-//
-// Notes:
-// - Frontend + WP plugin stay unchanged.
-// - Validation is vNext-aware (no more relationship/target/context legacy keys).
-// - Model routing supports base/premium via env with a simple risk-based switch.
+// ClearBound — Vercel Serverless API (vNext)
+// - Pulls prompts from clearbound-vnext repo structure
+// - In-memory prompt caching (TTL default 10m)
+// - Stageful errors for debugging
+// - Optional OpenAI retry (1x) for transient failures
+// - Model can be configured per output type via env
 
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const promptCache =
@@ -77,12 +71,12 @@ function safeJsonParse(text) {
 }
 
 function extractOutputText(data) {
-  // Prefer convenience field if present
+  // Prefer the convenience field if present
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // Otherwise attempt structured output extraction (Responses API)
+  // Otherwise attempt to extract from structured output (Responses API)
   const out = data?.output;
   if (!Array.isArray(out)) return "";
 
@@ -131,135 +125,88 @@ async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
   return r1;
 }
 
-/* =========================================================
-   vNext State Helpers
-   ========================================================= */
+function isNonEmptyString(v) {
+  return typeof v === "string" && v.trim().length > 0;
+}
 
-function getVNextIds(state) {
-  // vNext frontend schema (expected)
-  const relationship_axis = asLowerId(state?.relationship_axis?.value);
-  const impact = asLowerId(state?.risk_scan?.impact);        // high | low
-  const continuity = asLowerId(state?.risk_scan?.continuity); // high | mid | low
+function hasValueLike(obj) {
+  // Accepts: {value:"x"} or {"value":{...}} etc. Just check key exists and not empty.
+  if (!obj || typeof obj !== "object") return false;
+  if ("value" in obj) {
+    const v = obj.value;
+    if (typeof v === "string") return v.trim().length > 0;
+    if (v != null) return true;
+  }
+  return false;
+}
 
-  const situation_type = asLowerId(state?.context_builder?.situation_type);
-  const key_facts = String(state?.context_builder?.key_facts || "");
-  const main_concerns = Array.isArray(state?.context_builder?.main_concerns)
-    ? state.context_builder.main_concerns
-    : [];
-  const constraints = Array.isArray(state?.context_builder?.constraints)
-    ? state.context_builder.constraints
-    : [];
-
-  const intent = asLowerId(state?.intent); // vNext uses string id (e.g., "push_back")
-  const tone = asLowerId(state?.tone);     // calm | firm | formal
-  const depth = asLowerId(state?.depth || "standard"); // concise | standard | detailed
-
-  // backend-compat kept in frontend: state.format.value ("message"|"email")
-  const format = asLowerId(state?.format?.value);
-
-  // paywall (Step 6)
-  const paywallPkg = asLowerId(state?.paywall?.package);
-  const includeAnalysis = !!state?.paywall?.include_analysis;
-  const outputSel = asLowerId(state?.paywall?.output); // "message"|"email"|"both" (optional)
-
-  return {
-    relationship_axis,
-    impact,
-    continuity,
-    situation_type,
-    key_facts,
-    main_concerns,
-    constraints,
-    intent,
-    tone,
-    depth,
-    format,
-    paywallPkg,
-    includeAnalysis,
-    outputSel,
+/**
+ * vNext prompt paths:
+ * - prompts/intent/<intent>.prompt.md
+ * - prompts/normalize/normalize_state_to_canonical.prompt.md
+ * - prompts/output/{message|email|analysis_report}.prompt.md
+ * - prompts/assemble/assemble_generate.prompt.md
+ * - qa/rules/core.yaml (optional include)
+ */
+function resolveIntentPath(intentId) {
+  const map = {
+    address_issue: "prompts/intent/address_issue.prompt.md",
+    clarify_correct: "prompts/intent/clarify_correct.prompt.md",
+    close_loop: "prompts/intent/close_loop.prompt.md",
+    official: "prompts/intent/official.prompt.md",
+    push_back: "prompts/intent/push_back.prompt.md",
+    reset_expectations: "prompts/intent/reset_expectations.prompt.md",
+    set_boundary: "prompts/intent/set_boundary.prompt.md",
   };
+  return map[intentId] || null;
 }
 
-function validateVNextStateOrFail(fail, state) {
-  const ids = getVNextIds(state);
+function resolveOutputPath(formatId) {
+  // keep this permissive so UI tweaks won’t break backend
+  const f = asLowerId(formatId);
 
-  // Minimal required set to avoid breaking on minor UI changes.
-  // (We keep this conservative; normalize prompt handles many details.)
-  const missing = [];
+  const messageAliases = new Set([
+    "message",
+    "text",
+    "sms",
+    "dm",
+    "chat",
+    "im",
+    "note",
+  ]);
 
-  if (!ids.relationship_axis) missing.push("relationship_axis.value");
-  if (!ids.impact) missing.push("risk_scan.impact");
-  if (!ids.continuity) missing.push("risk_scan.continuity");
-  if (!ids.situation_type) missing.push("context_builder.situation_type");
+  const emailAliases = new Set(["email", "e-mail", "mail"]);
 
-  const facts = (ids.key_facts || "").trim();
-  if (facts.length < 20) missing.push("context_builder.key_facts(min 20 chars)");
+  const analysisAliases = new Set([
+    "analysis",
+    "analysis_report",
+    "report",
+    "diagnosis",
+    "review",
+  ]);
 
-  if (!ids.intent) missing.push("intent");
-  if (!ids.tone) missing.push("tone");
-  if (!ids.format) missing.push("format.value");
+  if (messageAliases.has(f)) return "prompts/output/message.prompt.md";
+  if (emailAliases.has(f)) return "prompts/output/email.prompt.md";
+  if (analysisAliases.has(f)) return "prompts/output/analysis_report.prompt.md";
 
-  if (missing.length) {
-    return fail(400, "validate_state_vnext", {
-      error: `Missing fields: ${missing.join(", ")}`,
-    });
-  }
-
-  // Soft checks
-  if (Array.isArray(ids.main_concerns) && ids.main_concerns.length > 2) {
-    return fail(400, "validate_state_vnext", {
-      error: "Too many main_concerns (max 2).",
-    });
-  }
-
-  return null; // OK
+  // Default to message if unknown to avoid hard-fail
+  return "prompts/output/message.prompt.md";
 }
 
-function riskScoreHeuristic(ids, rawText) {
-  // Simple, transparent heuristic for v1:
-  // - "official" intent or "high" consequences or "both+analysis" => higher risk
-  // - keyword bump (legal/financial/tenancy/employment/medical)
-  let score = 0;
+function pickModelForFormat(formatId) {
+  const base = pickEnv("OPENAI_MODEL", "gpt-4.1-mini");
 
-  const hiIntents = new Set(["official", "set_boundary", "push_back", "reset_expectations"]);
-  if (hiIntents.has(ids.intent)) score += 2;
+  const f = asLowerId(formatId);
+  const outputPath = resolveOutputPath(f);
 
-  if (ids.impact === "high") score += 2;
-  if (ids.continuity === "high") score += 1;
-
-  if (ids.includeAnalysis) score += 1;
-  if (ids.outputSel === "both") score += 1;
-
-  const t = String(rawText || "").toLowerCase();
-  const keywords = [
-    "law", "legal", "attorney", "lawsuit", "court", "contract", "invoice", "refund",
-    "rent", "tenant", "landlord", "evict", "deposit",
-    "terminate", "fired", "hr", "harassment", "discrimination",
-    "hospital", "clinic", "doctor", "medical", "insurance",
-    "police", "report", "threat", "safety",
-    "debt", "payment", "chargeback", "scam",
-  ];
-  for (const k of keywords) {
-    if (t.includes(k)) { score += 2; break; }
+  // Optional per-type overrides
+  if (outputPath.includes("/analysis_report.")) {
+    return pickEnv("OPENAI_MODEL_ANALYSIS", base);
   }
-
-  return score;
-}
-
-function selectModelFromHeuristic(ids, rawStateText) {
-  const base = pickEnv("OPENAI_MODEL_BASE", pickEnv("OPENAI_MODEL", "gpt-4.1-mini"));
-  const premium = pickEnv("OPENAI_MODEL_PREMIUM", "gpt-4.1");
-
-  // Threshold can be tuned via env
-  const threshold = Number(pickEnv("MODEL_SWITCH_RISK_THRESHOLD", "4")) || 4;
-
-  const score = riskScoreHeuristic(ids, rawStateText);
-
-  return {
-    model: score >= threshold ? premium : base,
-    risk_score: score,
-    threshold,
-  };
+  if (outputPath.includes("/email.")) {
+    return pickEnv("OPENAI_MODEL_EMAIL", base);
+  }
+  return pickEnv("OPENAI_MODEL_MESSAGE", base);
 }
 
 export default async function handler(req, res) {
@@ -281,69 +228,104 @@ export default async function handler(req, res) {
     const state = body.state;
 
     if (!state || typeof state !== "object") {
-      return fail(400, "validate_body", { error: "Missing or invalid `state` object" });
+      return fail(400, "validate_body", {
+        error: "Missing or invalid `state` object",
+      });
     }
 
-    // vNext validation (replaces v1 relationship/target/context requirement)
-    const vErr = validateVNextStateOrFail(fail, state);
-    if (vErr) return vErr;
+    // Required keys (vNext frontend still expected to send these)
+    // NOTE: we validate shape lightly (avoid breaking on UI schema changes)
+    const requiredKeys = ["relationship", "target", "intent", "tone", "format", "context"];
+    const missingKeys = requiredKeys.filter((k) => !(k in state));
+    if (missingKeys.length) {
+      return fail(400, "validate_state", {
+        error: `Missing fields: ${missingKeys.join(", ")}`,
+      });
+    }
 
-    const ids = getVNextIds(state);
+    // Light shape checks so "present but empty" fails clearly
+    const relationshipOk = hasValueLike(state.relationship);
+    const targetOk = hasValueLike(state.target);
+    const intentOk = hasValueLike(state.intent);
+    const toneOk = hasValueLike(state.tone);
+    const formatOk = hasValueLike(state.format);
+
+    // context can be string, or object containing any non-empty text
+    const contextOk =
+      isNonEmptyString(state.context) ||
+      (state.context &&
+        typeof state.context === "object" &&
+        (isNonEmptyString(state.context.text) ||
+          isNonEmptyString(state.context.value) ||
+          isNonEmptyString(state.context.summary) ||
+          isNonEmptyString(state.context.raw)));
+
+    const shapeMissing = [];
+    if (!relationshipOk) shapeMissing.push("relationship.value");
+    if (!targetOk) shapeMissing.push("target.value");
+    if (!intentOk) shapeMissing.push("intent.value");
+    if (!toneOk) shapeMissing.push("tone.value");
+    if (!formatOk) shapeMissing.push("format.value");
+    if (!contextOk) shapeMissing.push("context(text)");
+
+    if (shapeMissing.length) {
+      return fail(400, "validate_state_shape", {
+        error: "Invalid or empty fields",
+        details: { missing: shapeMissing },
+      });
+    }
 
     // Env
     const OPENAI_API_KEY = pickEnv("OPENAI_API_KEY");
-    const PROMPTS_REPO = pickEnv("PROMPTS_REPO"); // should point to useclearbound-netizen/clearbound-vnext
+    const PROMPTS_REPO = pickEnv("PROMPTS_REPO");
     const PROMPTS_REF = pickEnv("PROMPTS_REF", "main");
 
     if (!OPENAI_API_KEY) return fail(500, "env", { error: "OPENAI_API_KEY missing" });
     if (!PROMPTS_REPO) return fail(500, "env", { error: "PROMPTS_REPO missing" });
 
-    // Cache TTL (ms)
     const ttlMs =
       Number(pickEnv("PROMPT_CACHE_TTL_MS", String(DEFAULT_CACHE_TTL_MS))) ||
       DEFAULT_CACHE_TTL_MS;
 
-    // Determine requested outputs
-    // - Prefer explicit paywall.output when present, else fall back to format.value
-    // - If paywall says "both", we include both output specs.
-    const wantBoth = ids.outputSel === "both";
-    const wantEmail = wantBoth ? true : (ids.outputSel ? ids.outputSel === "email" : ids.format === "email");
-    const wantMessage = wantBoth ? true : (ids.outputSel ? ids.outputSel === "message" : ids.format === "message");
-    const wantAnalysis = ids.includeAnalysis === true;
+    // IDs
+    const intentId = asLowerId(state.intent?.value);
+    const formatId = asLowerId(state.format?.value);
 
-    // GitHub raw URLs
+    const intentPath = resolveIntentPath(intentId);
+    if (!intentPath) {
+      return fail(400, "validate_ids", {
+        error: "Invalid intent value",
+        details: { intentId },
+      });
+    }
+
+    const outputPath = resolveOutputPath(formatId);
+
+    // GitHub raw URL
     const ghRaw = (path) =>
       `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
-    // Prompt paths (clearbound-vnext repo)
-    // (These files were committed in your baseline.)
-    const promptPaths = {
-      normalize: `prompts/normalize/normalize_state_to_canonical.prompt.md`,
-      intent: `prompts/intent/${ids.intent}.prompt.md`,
-      assemble: `prompts/assemble/assemble_generate.prompt.md`,
-      output_message: `prompts/output/message.prompt.md`,
-      output_email: `prompts/output/email.prompt.md`,
-      output_analysis: `prompts/output/analysis_report.prompt.md`,
-    };
+    // Prompts
+    const normalizePath = "prompts/normalize/normalize_state_to_canonical.prompt.md";
+    const assemblePath = "prompts/assemble/assemble_generate.prompt.md";
+    const qaCorePath = "qa/rules/core.yaml";
 
-    // Fetch prompts (cached)
-    let normalizePrompt,
-      intentPrompt,
-      assemblePrompt,
-      outputMessagePrompt,
-      outputEmailPrompt,
-      outputAnalysisPrompt;
+    const includeQa = String(pickEnv("INCLUDE_QA_RULES", "1")) === "1";
+
+    let intentPrompt, normalizePrompt, outputPrompt, assemblePrompt, qaRulesPrompt;
 
     try {
-      const entries = Object.entries(promptPaths);
+      const fetches = [
+        ["intent", intentPath],
+        ["normalize", normalizePath],
+        ["output", outputPath],
+        ["assemble", assemblePath],
+      ];
 
-      const fetched = await Promise.all(
-        entries.map(async ([label, path]) => {
-          // Only fetch output specs that we actually need (saves time/cost)
-          if (label === "output_message" && !wantMessage) return [label, ""];
-          if (label === "output_email" && !wantEmail) return [label, ""];
-          if (label === "output_analysis" && !wantAnalysis) return [label, ""];
+      if (includeQa) fetches.push(["qa", qaCorePath]);
 
+      const results = await Promise.all(
+        fetches.map(async ([label, path]) => {
           const url = ghRaw(path);
           const key = cacheKey(PROMPTS_REPO, PROMPTS_REF, path);
           const text = await fetchTextWithCache(url, key, ttlMs);
@@ -351,78 +333,42 @@ export default async function handler(req, res) {
         })
       );
 
-      const map = Object.fromEntries(fetched);
-
-      normalizePrompt = map.normalize || "";
-      intentPrompt = map.intent || "";
-      assemblePrompt = map.assemble || "";
-      outputMessagePrompt = map.output_message || "";
-      outputEmailPrompt = map.output_email || "";
-      outputAnalysisPrompt = map.output_analysis || "";
+      const byLabel = Object.fromEntries(results);
+      intentPrompt = byLabel.intent;
+      normalizePrompt = byLabel.normalize;
+      outputPrompt = byLabel.output;
+      assemblePrompt = byLabel.assemble;
+      qaRulesPrompt = byLabel.qa || "";
     } catch (e) {
       return fail(502, "prompt_fetch", { error: String(e?.message || e) });
     }
 
-    if (!normalizePrompt.trim()) return fail(502, "prompt_fetch", { error: "normalize prompt empty" });
-    if (!intentPrompt.trim()) return fail(502, "prompt_fetch", { error: "intent prompt empty" });
-    if (!assemblePrompt.trim()) return fail(502, "prompt_fetch", { error: "assemble prompt empty" });
-
-    // System assembly (vNext):
-    // normalize → intent → assemble → output specs (message/email/analysis as needed)
-    const system = [
-      "Return ONLY the final output. No commentary, no JSON, no extra sections unless the output spec asks for them.",
+    // System assembly (vNext)
+    // Order:
+    // normalize → intent → output → assemble (+ optional qa rules)
+    const systemParts = [
+      "Return ONLY the final output. No explanations.",
       "",
       normalizePrompt,
       "",
       intentPrompt,
       "",
+      outputPrompt,
+      "",
       assemblePrompt,
-      "",
-      wantAnalysis ? outputAnalysisPrompt : "",
-      "",
-      wantMessage ? outputMessagePrompt : "",
-      "",
-      wantEmail ? outputEmailPrompt : "",
-    ]
-      .filter((x) => typeof x === "string")
-      .join("\n");
+    ];
 
-    // User content: send the raw state (frontend-fixed) + a tiny derived hint block
-    // (The normalize prompt can use this; harmless if ignored.)
-    const derivedHint = {
-      vnext_ids: {
-        relationship_axis: ids.relationship_axis,
-        impact: ids.impact,
-        continuity: ids.continuity,
-        situation_type: ids.situation_type,
-        intent: ids.intent,
-        tone: ids.tone,
-        depth: ids.depth,
-        format: ids.format,
-        paywall: {
-          package: ids.paywallPkg || null,
-          include_analysis: wantAnalysis,
-          output: ids.outputSel || null,
-        },
-      },
-    };
+    if (includeQa && qaRulesPrompt) {
+      systemParts.push("", "=== QA RULES (for internal compliance) ===", qaRulesPrompt);
+    }
 
-    const user = [
-      "INPUT_STATE (raw, frontend-fixed):",
-      JSON.stringify(state, null, 2),
-      "",
-      "DERIVED_HINT (server-side, non-authoritative):",
-      JSON.stringify(derivedHint, null, 2),
-    ].join("\n");
+    const system = systemParts.join("\n");
 
-    // Model selection (base vs premium)
+    const user = JSON.stringify(state, null, 2);
+
+    // OpenAI request
+    const model = pickModelForFormat(formatId);
     const retryOnce = String(pickEnv("OPENAI_RETRY_ONCE", "1")) === "1";
-    const { model, risk_score, threshold } = selectModelFromHeuristic(ids, user);
-
-    // Token limits (can be tuned via env)
-    const maxOut =
-      Number(pickEnv("MAX_OUTPUT_TOKENS", wantBoth || wantAnalysis ? "1200" : "700")) ||
-      (wantBoth || wantAnalysis ? 1200 : 700);
 
     const payload = {
       model,
@@ -430,8 +376,8 @@ export default async function handler(req, res) {
         { role: "system", content: system },
         { role: "user", content: user },
       ],
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.4")) || 0.4,
-      max_output_tokens: maxOut,
+      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.4")),
+      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS", "700")),
     };
 
     const r = await callOpenAIWithOptionalRetry({
@@ -445,7 +391,6 @@ export default async function handler(req, res) {
         error: "OpenAI failed",
         http_status: r.status,
         details: r.data || { raw: (r.raw || "").slice(0, 600) },
-        meta: { model, risk_score, threshold },
       });
     }
 
@@ -453,18 +398,21 @@ export default async function handler(req, res) {
     if (!resultText) {
       return fail(502, "openai_output", {
         error: "Empty result",
-        details: {
-          id: r.data?.id,
-          status: r.data?.status,
-        },
-        meta: { model, risk_score, threshold },
+        details: { id: r.data?.id, status: r.data?.status },
       });
     }
 
     return res.status(200).json({
       ok: true,
       result_text: resultText,
-      meta: { model, risk_score, threshold },
+      meta: {
+        model,
+        prompts_repo: PROMPTS_REPO,
+        prompts_ref: PROMPTS_REF,
+        intent: intentId,
+        output: outputPath,
+        include_qa: includeQa,
+      },
     });
   } catch (e) {
     return res.status(500).json({
