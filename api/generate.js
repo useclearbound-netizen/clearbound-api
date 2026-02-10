@@ -1,14 +1,16 @@
 // /api/generate.js
 // ClearBound — Vercel Serverless API (vNext)
-// 3-PASS Stable Pipeline
+// 3-PASS Stable Pipeline (package-gated)
 // Pass A: state -> canonical
-// Pass B: canonical -> layer1
-// Pass C: {canonical, layer1} -> final deliverables JSON
+// Pass B: canonical -> layer1 (deterministic control JSON)
+// Pass C: {canonical, layer1} -> final deliverables JSON (ONLY what package requires)
 //
-// ✅ CommonJS (avoids ESM/node-fetch invocation crashes)
-// ✅ Uses global fetch (Node 18+ on Vercel)
-// ✅ Strong error staging + always returns JSON
-// ✅ Front contract: state is an object (relationship/target/intent/tone/format/context)
+// Key fixes:
+// ✅ Package-gated Pass C prompts (prevents "email but analysis shows" bugs)
+// ✅ Post-enforce output fields by package (hard guarantee)
+// ✅ Lazy-fetch only needed output prompts (speed)
+// ✅ More robust JSON extraction (reduces pass missing canonical/layer1)
+// ✅ Optional timeouts for fetch/OpenAI calls
 
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const promptCache =
@@ -17,11 +19,9 @@ const promptCache =
 function now() {
   return Date.now();
 }
-
 function cacheKey(repo, ref, path) {
   return `${repo}@${ref}:${path}`;
 }
-
 function getCached(key) {
   const hit = promptCache.get(key);
   if (!hit) return null;
@@ -31,40 +31,48 @@ function getCached(key) {
   }
   return hit.value;
 }
-
 function setCached(key, value, ttlMs) {
   promptCache.set(key, { value, expiresAt: now() + ttlMs });
 }
-
 function pickEnv(name, fallback = null) {
   const v = process.env[name];
   return v == null || v === "" ? fallback : v;
 }
-
 function jsonFail(res, status, stage, extra = {}) {
   return res.status(status).json({ ok: false, stage, ...extra });
 }
-
 function asLowerId(v) {
   return String(v || "").trim().toLowerCase();
 }
 
-async function fetchTextWithCache(url, key, ttlMs) {
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(new Error("timeout")), ms);
+  return { controller, cancel: () => clearTimeout(t) };
+}
+
+async function fetchTextWithCache(url, key, ttlMs, timeoutMs = 8000) {
   const cached = getCached(key);
   if (cached != null) return cached;
 
-  const r = await fetch(url, {
-    method: "GET",
-    headers: { "Cache-Control": "no-cache" },
-  });
+  const { controller, cancel } = withTimeout(timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { "Cache-Control": "no-cache" },
+      signal: controller.signal,
+    });
 
-  const text = await r.text().catch(() => "");
-  if (!r.ok) {
-    throw new Error(`PROMPT_FETCH_FAIL:${r.status}:${url}:${text.slice(0, 200)}`);
+    const text = await r.text().catch(() => "");
+    if (!r.ok) {
+      throw new Error(`PROMPT_FETCH_FAIL:${r.status}:${url}:${text.slice(0, 200)}`);
+    }
+
+    setCached(key, text, ttlMs);
+    return text;
+  } finally {
+    cancel();
   }
-
-  setCached(key, text, ttlMs);
-  return text;
 }
 
 function safeJsonParse(text) {
@@ -75,11 +83,34 @@ function safeJsonParse(text) {
   }
 }
 
+// Extract the first JSON object from a possibly noisy text response
+function extractJsonObject(text) {
+  if (typeof text !== "string") return null;
+  const t = text.trim();
+  if (!t) return null;
+
+  // Fast path
+  const direct = safeJsonParse(t);
+  if (direct && typeof direct === "object") return direct;
+
+  // Try to locate JSON boundaries
+  const first = t.indexOf("{");
+  const last = t.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    const slice = t.slice(first, last + 1);
+    const obj = safeJsonParse(slice);
+    if (obj && typeof obj === "object") return obj;
+  }
+  return null;
+}
+
 function extractOutputText(data) {
+  // Prefer convenience field if present
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
+  // Otherwise extract from structured output array
   const out = data?.output;
   if (!Array.isArray(out)) return "";
 
@@ -94,31 +125,41 @@ function extractOutputText(data) {
   return acc.trim();
 }
 
-async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
+async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce, timeoutMs = 20000 }) {
   const url = "https://api.openai.com/v1/responses";
 
   const attempt = async () => {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+    const { controller, cancel } = withTimeout(timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
 
-    const raw = await resp.text().catch(() => "");
-    const data = safeJsonParse(raw);
-    return { ok: resp.ok, status: resp.status, data, raw };
+      const raw = await resp.text().catch(() => "");
+      const data = safeJsonParse(raw);
+
+      return { ok: resp.ok, status: resp.status, data, raw };
+    } finally {
+      cancel();
+    }
   };
 
+  // Attempt 1
   let r1 = await attempt();
   if (r1.ok) return r1;
 
+  // Retry once on likely transient errors
   const transient = [408, 429, 500, 502, 503, 504].includes(r1.status);
   if (retryOnce && transient) {
     await new Promise((resolve) => setTimeout(resolve, 250));
-    return attempt();
+    const r2 = await attempt();
+    return r2;
   }
 
   return r1;
@@ -127,7 +168,6 @@ async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
 function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
-
 function hasValueLike(obj) {
   if (!obj || typeof obj !== "object") return false;
   if ("value" in obj) {
@@ -138,6 +178,17 @@ function hasValueLike(obj) {
   return false;
 }
 
+/**
+ * vNext prompt paths:
+ * - prompts/normalize/normalize_state_to_canonical.prompt.md
+ * - prompts/layer1/layer1_control.prompt.md
+ * - prompts/intent/<intent>.prompt.md
+ * - prompts/output/message.prompt.md
+ * - prompts/output/email.prompt.md
+ * - prompts/output/analysis_report.prompt.md
+ * - prompts/assemble/assemble_generate.prompt.md
+ * - qa/rules/core.yaml (optional include)
+ */
 function resolveIntentPath(intentId) {
   const map = {
     address_issue: "prompts/intent/address_issue.prompt.md",
@@ -152,6 +203,7 @@ function resolveIntentPath(intentId) {
 }
 
 function looksLikeFrontState(state) {
+  // front sends: relationship/target/intent/tone/format/context
   const requiredKeys = ["relationship", "target", "intent", "tone", "format", "context"];
   const missing = requiredKeys.filter((k) => !(k in state));
   return { ok: missing.length === 0, missing };
@@ -188,23 +240,20 @@ function ensureObjectHasKey(obj, key) {
   return obj && typeof obj === "object" && key in obj;
 }
 
-function coerceJsonObjectOrFail(text) {
-  const obj = safeJsonParse(text);
-  if (!obj || typeof obj !== "object") return null;
-  return obj;
-}
-
 function pickModel(passName, formatId) {
+  // Optional per-pass overrides
   const base = pickEnv("OPENAI_MODEL", "gpt-4.1-mini");
   if (passName === "passA_normalize") return pickEnv("OPENAI_MODEL_NORMALIZE", base);
   if (passName === "passB_layer1") return pickEnv("OPENAI_MODEL_LAYER1", base);
 
+  // Pass C: output generation (can be per type if you want)
   const f = asLowerId(formatId);
   if (f === "email") return pickEnv("OPENAI_MODEL_EMAIL", base);
   return pickEnv("OPENAI_MODEL_MESSAGE", base);
 }
 
 function promptHeader(passName) {
+  // Strong contract enforcement per pass
   return [
     "CRITICAL OUTPUT CONTRACT:",
     "- Return ONLY valid JSON.",
@@ -215,26 +264,50 @@ function promptHeader(passName) {
   ].join("\n");
 }
 
-// ---- Body Normalizer (IMPORTANT) ----
-function normalizeReqBody(req) {
-  // Depending on Vercel/Next config, req.body might be:
-  // - object (already parsed)
-  // - string (raw JSON)
-  // - undefined
-  const b = req.body;
-
-  if (!b) return null;
-  if (typeof b === "object") return b;
-
-  if (typeof b === "string") {
-    const parsed = safeJsonParse(b);
-    return parsed || null;
-  }
-
+// Package gating helpers
+function normalizePackageId(pkg) {
+  const p = asLowerId(pkg);
+  // allowed: message|email|analysis_message|analysis_email|total
+  if (["message", "email", "analysis_message", "analysis_email", "total"].includes(p)) return p;
   return null;
 }
 
-module.exports = async function handler(req, res) {
+function allowedOutputsByPackage(pkg) {
+  const p = normalizePackageId(pkg);
+  if (p === "message") return { message: true, email: false, analysis: false };
+  if (p === "email") return { message: false, email: true, analysis: false };
+  if (p === "analysis_message") return { message: true, email: false, analysis: true };
+  if (p === "analysis_email") return { message: false, email: true, analysis: true };
+  if (p === "total") return { message: true, email: true, analysis: true };
+  // null/unknown => be strict (nothing)
+  return { message: false, email: false, analysis: false };
+}
+
+function enforceFinalByPackage(finalObj, pkg) {
+  const allow = allowedOutputsByPackage(pkg);
+  const out = { ...finalObj };
+
+  // hard guarantee of these keys existing
+  if (!("package" in out)) out.package = normalizePackageId(pkg) || null;
+  else out.package = normalizePackageId(out.package) || normalizePackageId(pkg) || null;
+
+  if (!("safety_disclaimer" in out)) out.safety_disclaimer = "";
+
+  // normalize missing keys to null
+  if (!("message_text" in out)) out.message_text = null;
+  if (!("email_text" in out)) out.email_text = null;
+  if (!("analysis_report" in out)) out.analysis_report = null;
+  if (!("notes" in out)) out.notes = null;
+
+  // enforce gating
+  if (!allow.message) out.message_text = null;
+  if (!allow.email) out.email_text = null;
+  if (!allow.analysis) out.analysis_report = null;
+
+  return out;
+}
+
+export default async function handler(req, res) {
   // CORS (minimal)
   const allowOrigin = pickEnv("ALLOW_ORIGIN", "*");
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -247,12 +320,10 @@ module.exports = async function handler(req, res) {
   const fail = (status, stage, extra = {}) => jsonFail(res, status, stage, extra);
 
   try {
-    const body = normalizeReqBody(req);
-    if (!body || typeof body !== "object") {
-      return fail(400, "validate_body", { error: "Missing or invalid JSON body" });
-    }
-
+    // Body validation
+    const body = req.body || {};
     const state = body.state;
+
     if (!state || typeof state !== "object") {
       return fail(400, "validate_body", { error: "Missing or invalid `state` object" });
     }
@@ -286,30 +357,27 @@ module.exports = async function handler(req, res) {
     const includeQa = String(pickEnv("INCLUDE_QA_RULES", "1")) === "1";
     const retryOnce = String(pickEnv("OPENAI_RETRY_ONCE", "1")) === "1";
 
+    // GitHub raw URL builder
     const ghRaw = (path) =>
       `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
+    // Fixed shared prompt paths
     const normalizePath = "prompts/normalize/normalize_state_to_canonical.prompt.md";
     const layer1Path = "prompts/layer1/layer1_control.prompt.md";
     const assemblePath = "prompts/assemble/assemble_generate.prompt.md";
-
     const outputMessagePath = "prompts/output/message.prompt.md";
     const outputEmailPath = "prompts/output/email.prompt.md";
     const outputAnalysisPath = "prompts/output/analysis_report.prompt.md";
-
     const qaCorePath = "qa/rules/core.yaml";
 
-    // Fetch shared prompts
-    let normalizePrompt, layer1Prompt, assemblePrompt, outMsgPrompt, outEmailPrompt, outAnalysisPrompt, qaRulesPrompt;
+    // Fetch only the prompts needed up-front (normalize, layer1, assemble, optional QA)
+    let normalizePrompt, layer1Prompt, assemblePrompt, qaRulesPrompt;
 
     try {
       const fetches = [
         ["normalize", normalizePath],
         ["layer1", layer1Path],
         ["assemble", assemblePath],
-        ["out_msg", outputMessagePath],
-        ["out_email", outputEmailPath],
-        ["out_analysis", outputAnalysisPath],
       ];
       if (includeQa) fetches.push(["qa", qaCorePath]);
 
@@ -326,9 +394,6 @@ module.exports = async function handler(req, res) {
       normalizePrompt = byLabel.normalize;
       layer1Prompt = byLabel.layer1;
       assemblePrompt = byLabel.assemble;
-      outMsgPrompt = byLabel.out_msg;
-      outEmailPrompt = byLabel.out_email;
-      outAnalysisPrompt = byLabel.out_analysis;
       qaRulesPrompt = byLabel.qa || "";
     } catch (e) {
       return fail(502, "prompt_fetch", { error: String(e?.message || e) });
@@ -347,13 +412,14 @@ module.exports = async function handler(req, res) {
         { role: "user", content: passA_user },
       ],
       temperature: Number(pickEnv("OPENAI_TEMPERATURE_NORMALIZE", "0.0")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_NORMALIZE", "900")),
+      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_NORMALIZE", "700")),
     };
 
     const a = await callOpenAIWithOptionalRetry({
       apiKey: OPENAI_API_KEY,
       payload: passA_payload,
       retryOnce,
+      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
     });
 
     if (!a.ok) {
@@ -365,13 +431,13 @@ module.exports = async function handler(req, res) {
     }
 
     const passA_text = extractOutputText(a.data);
-    const passA_obj = coerceJsonObjectOrFail(passA_text);
+    const passA_obj = extractJsonObject(passA_text);
 
     if (!passA_obj || !ensureObjectHasKey(passA_obj, "canonical")) {
       return fail(502, "passA_missing_canonical", {
         error: "Pass A missing `canonical` object",
         details: {
-          snippet: (passA_text || "").slice(0, 400),
+          snippet: (passA_text || "").slice(0, 500),
           keys: passA_obj ? Object.keys(passA_obj) : null,
         },
       });
@@ -380,6 +446,18 @@ module.exports = async function handler(req, res) {
     const canonical = passA_obj.canonical;
     if (!canonical || typeof canonical !== "object") {
       return fail(502, "passA_bad_canonical", { error: "Invalid canonical payload" });
+    }
+
+    // Determine package early (canonical.package preferred; fallback to front paywall package)
+    const packageFront = normalizePackageId(state?.context?.paywall?.package);
+    const packageCanonical = normalizePackageId(canonical?.package);
+    const packageId = packageCanonical || packageFront;
+
+    if (!packageId) {
+      return fail(400, "validate_package", {
+        error: "Missing or invalid package (canonical.package or state.context.paywall.package)",
+        details: { canonical_package: canonical?.package || null, front_package: packageFront || null },
+      });
     }
 
     // -----------------------
@@ -395,13 +473,14 @@ module.exports = async function handler(req, res) {
         { role: "user", content: passB_user },
       ],
       temperature: Number(pickEnv("OPENAI_TEMPERATURE_LAYER1", "0.0")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_LAYER1", "1200")),
+      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_LAYER1", "900")),
     };
 
     const b = await callOpenAIWithOptionalRetry({
       apiKey: OPENAI_API_KEY,
       payload: passB_payload,
       retryOnce,
+      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
     });
 
     if (!b.ok) {
@@ -413,13 +492,13 @@ module.exports = async function handler(req, res) {
     }
 
     const passB_text = extractOutputText(b.data);
-    const passB_obj = coerceJsonObjectOrFail(passB_text);
+    const passB_obj = extractJsonObject(passB_text);
 
     if (!passB_obj || !ensureObjectHasKey(passB_obj, "layer1")) {
       return fail(502, "passB_missing_layer1", {
         error: "Pass B missing `layer1` object",
         details: {
-          snippet: (passB_text || "").slice(0, 400),
+          snippet: (passB_text || "").slice(0, 500),
           keys: passB_obj ? Object.keys(passB_obj) : null,
         },
       });
@@ -432,10 +511,10 @@ module.exports = async function handler(req, res) {
 
     // -----------------------
     // PASS C: {canonical, layer1} -> final deliverables JSON
+    // (Package-gated prompts + post-enforce)
     // -----------------------
     const intentId = asLowerId(canonical.intent);
     const intentPath = resolveIntentPath(intentId);
-
     if (!intentPath) {
       return fail(400, "validate_ids", {
         error: "Invalid intent value (canonical.intent)",
@@ -443,6 +522,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    // Fetch intent prompt
     let intentPrompt;
     try {
       const url = ghRaw(intentPath);
@@ -452,31 +532,78 @@ module.exports = async function handler(req, res) {
       return fail(502, "prompt_fetch_intent", { error: String(e?.message || e) });
     }
 
+    // Fetch ONLY output prompts needed for this package
+    const allow = allowedOutputsByPackage(packageId);
+    let outMsgPrompt = "";
+    let outEmailPrompt = "";
+    let outAnalysisPrompt = "";
+
+    try {
+      const fetches = [];
+      if (allow.message) fetches.push(["out_msg", outputMessagePath]);
+      if (allow.email) fetches.push(["out_email", outputEmailPath]);
+      if (allow.analysis) fetches.push(["out_analysis", outputAnalysisPath]);
+
+      if (fetches.length) {
+        const results = await Promise.all(
+          fetches.map(async ([label, path]) => {
+            const url = ghRaw(path);
+            const key = cacheKey(PROMPTS_REPO, PROMPTS_REF, path);
+            const text = await fetchTextWithCache(url, key, ttlMs);
+            return [label, text];
+          })
+        );
+        const byLabel = Object.fromEntries(results);
+        outMsgPrompt = byLabel.out_msg || "";
+        outEmailPrompt = byLabel.out_email || "";
+        outAnalysisPrompt = byLabel.out_analysis || "";
+      }
+    } catch (e) {
+      return fail(502, "prompt_fetch_outputs", { error: String(e?.message || e) });
+    }
+
+    // Build Pass C system with STRICT package gating
     const systemParts = [
       promptHeader("passC_assemble"),
       "",
       "Return ONLY the final JSON deliverables. No explanations.",
+      `Package gate: ${packageId}`,
+      "IMPORTANT:",
+      "- Output ONLY the fields allowed by the package gate.",
+      "- If package is email, do NOT output analysis_report or message_text.",
+      "- If package is message, do NOT output analysis_report or email_text.",
+      "- If package is analysis_email, output ONLY analysis_report + email_text.",
+      "- If package is analysis_message, output ONLY analysis_report + message_text.",
+      "- If package is total, output all three.",
       "",
       intentPrompt,
-      "",
-      "=== OUTPUT RULES: MESSAGE ===",
-      outMsgPrompt,
-      "",
-      "=== OUTPUT RULES: EMAIL ===",
-      outEmailPrompt,
-      "",
-      "=== OUTPUT RULES: ANALYSIS REPORT ===",
-      outAnalysisPrompt,
-      "",
-      assemblePrompt,
     ];
+
+    if (allow.message) {
+      systemParts.push("", "=== OUTPUT RULES: MESSAGE ===", outMsgPrompt);
+    }
+    if (allow.email) {
+      systemParts.push("", "=== OUTPUT RULES: EMAIL ===", outEmailPrompt);
+    }
+    if (allow.analysis) {
+      systemParts.push("", "=== OUTPUT RULES: ANALYSIS REPORT ===", outAnalysisPrompt);
+    }
+
+    systemParts.push("", assemblePrompt);
 
     if (includeQa && qaRulesPrompt) {
       systemParts.push("", "=== QA RULES (internal compliance) ===", qaRulesPrompt);
     }
 
     const passC_system = systemParts.join("\n");
-    const passC_user = JSON.stringify({ canonical, layer1 }, null, 2);
+    const passC_user = JSON.stringify(
+      {
+        canonical: { ...canonical, package: packageId }, // ensure consistent
+        layer1,
+      },
+      null,
+      2
+    );
 
     const formatId = asLowerId(state.format?.value);
     const passC_payload = {
@@ -485,14 +612,16 @@ module.exports = async function handler(req, res) {
         { role: "system", content: passC_system },
         { role: "user", content: passC_user },
       ],
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.4")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS", "900")),
+      // Lower temp helps stability; speed comes mostly from gating prompts + fewer tokens
+      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.2")),
+      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS", allow.analysis ? "900" : "650")),
     };
 
     const c = await callOpenAIWithOptionalRetry({
       apiKey: OPENAI_API_KEY,
       payload: passC_payload,
       retryOnce,
+      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
     });
 
     if (!c.ok) {
@@ -511,14 +640,18 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const finalObj = safeJsonParse(passC_text);
-    if (!finalObj || typeof finalObj !== "object") {
+    const finalObjRaw = extractJsonObject(passC_text);
+    if (!finalObjRaw || typeof finalObjRaw !== "object") {
       return fail(502, "passC_non_json", {
         error: "Final output is not valid JSON",
         details: { snippet: passC_text.slice(0, 600) },
       });
     }
 
+    // Post-enforce by package (hard guarantee)
+    const finalObj = enforceFinalByPackage(finalObjRaw, packageId);
+
+    // Final minimal required keys
     if (!("package" in finalObj) || !("safety_disclaimer" in finalObj)) {
       return fail(502, "passC_bad_schema", {
         error: "Final JSON missing required fields",
@@ -528,9 +661,10 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      result_text: passC_text,
+      result_text: JSON.stringify(finalObj), // front expects a string
       meta: {
-        pipeline: "3-pass",
+        pipeline: "3-pass-package-gated",
+        package: packageId,
         model: passC_payload.model,
         prompts_repo: PROMPTS_REPO,
         prompts_ref: PROMPTS_REF,
@@ -541,7 +675,6 @@ module.exports = async function handler(req, res) {
       },
     });
   } catch (e) {
-    // IMPORTANT: never throw -> always JSON
     return res.status(500).json({
       ok: false,
       stage: "server_error",
@@ -549,4 +682,4 @@ module.exports = async function handler(req, res) {
       details: String(e?.message || e),
     });
   }
-};
+}
