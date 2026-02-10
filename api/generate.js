@@ -4,6 +4,9 @@
 // - Code-based control flags (record-safe, tone ceiling, max chars)
 // - Model routing: DEFAULT vs HIGH_RISK
 // - Strict JSON output gating (+ optional repair call if JSON parse fails)
+//
+// NOTE (2026-02): Some models reject non-default temperature overrides.
+// To keep runtime stable, we DO NOT send temperature at all.
 
 const OpenAI = require("openai");
 
@@ -24,15 +27,12 @@ async function loadGuidelineMap() {
   const ttlSec = Number(process.env.CB_GUIDELINE_TTL_SEC || 300);
   const now = Date.now();
 
-  if (_guidelineCache && now - _guidelineCacheAt < ttlSec * 1000) {
-    return _guidelineCache;
-  }
+  if (_guidelineCache && now - _guidelineCacheAt < ttlSec * 1000) return _guidelineCache;
 
   const resp = await fetch(url, { method: "GET" });
   if (!resp.ok) throw new Error(`Failed to fetch GUIDELINE_MAP (${resp.status})`);
 
   const json = await resp.json();
-
   if (!json?.relationship || !json?.intent) {
     throw new Error("Invalid GUIDELINE_MAP payload (missing relationship/intent)");
   }
@@ -87,6 +87,7 @@ function computeControlFlags({ risk_scan, format, intent, tone }) {
   const isEmail = format === "email";
   const isOfficialIntent = intent === "make_it_official";
 
+  // NOTE: 현재 정책상 email은 record-safe로 취급
   const record_safe_required = isHighRisk || isEmail || isOfficialIntent;
 
   const tone_floor = "calm";
@@ -177,23 +178,19 @@ function buildToneMicroStyle(control) {
 }
 
 function pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format }) {
-  // Highest priority: record-safe + make_it_official per relationship
   if (control.record_safe_required && intent === "make_it_official") {
     const f = GUIDELINE_MAP.fewshot_record_safe?.make_it_official?.[relationship];
     if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
   }
 
-  // Next: record-safe default per relationship
   if (control.record_safe_required) {
     const f = GUIDELINE_MAP.fewshot_record_safe?.[relationship]?.["__default__"];
     if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
   }
 
-  // Otherwise: normal few-shot per relationship
   const f = GUIDELINE_MAP.fewshot?.[relationship]?.["__default__"];
   if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
 
-  // Last-resort generic floor
   return format === "email"
     ? { email_text: "Subject: Quick alignment\n\nHi —\n\nCould you confirm the next step by [deadline]?\n\nThanks,\n[Your Name]" }
     : { message_text: "Hi — could you confirm the next step when you have a moment? Thanks." };
@@ -302,22 +299,15 @@ function validateJsonResult(obj, pkgSchema) {
   return true;
 }
 
-async function callLLM({ model, temperature, system, user, allowTemp }) {
-  // FIX: 일부 모델은 temperature override를 지원하지 않음.
-  // - allowTemp=false인 경우 temperature를 payload에서 아예 제거한다.
-  const payload = {
+async function callLLM({ model, system, user }) {
+  // NOTE: Do NOT send temperature to avoid model-specific parameter rejection.
+  const r = await client.chat.completions.create({
     model,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-  };
-
-  if (allowTemp && typeof temperature === "number" && !Number.isNaN(temperature)) {
-    payload.temperature = temperature;
-  }
-
-  const r = await client.chat.completions.create(payload);
+  });
   return r.choices?.[0]?.message?.content ?? "";
 }
 
@@ -354,30 +344,17 @@ function safeFallback(pkg) {
 /* ---------------------------
  * Model routing (LOCKed policy)
  * -------------------------- */
-function pickModelAndTemp(control) {
-  const model = control.record_safe_required
+function pickModel(control) {
+  return control.record_safe_required
     ? (process.env.CB_MODEL_HIGH_RISK || "gpt-5")
     : (process.env.CB_MODEL_DEFAULT || "gpt-4.1-mini");
-
-  const temperature = control.record_safe_required
-    ? Number(process.env.CB_TEMPERATURE_HIGH_RISK ?? 0.2)
-    : Number(process.env.CB_TEMPERATURE_DEFAULT ?? 0.4);
-
-  // FIX: DEFAULT 모델에서는 temperature override를 쓰지 않는다.
-  const allowTemp = !!control.record_safe_required;
-
-  return { model, temperature, allowTemp };
 }
 
 /* ---------------------------
  * Request parsing
  * -------------------------- */
 function parseState(req) {
-  // WordPress proxy may send { state: "<json>" }.
-  // Direct calls may send JSON object directly.
-  if (req?.body?.state) {
-    return JSON.parse(req.body.state);
-  }
+  if (req?.body?.state) return JSON.parse(req.body.state);
   return req.body || {};
 }
 
@@ -386,7 +363,6 @@ function parseState(req) {
  * -------------------------- */
 module.exports = async function handler(req, res) {
   try {
-    // Basic CORS (optional; safe if ALLOW_ORIGIN set)
     const allowOrigin = process.env.ALLOW_ORIGIN || "*";
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -398,11 +374,7 @@ module.exports = async function handler(req, res) {
     const GUIDELINE_MAP = await loadGuidelineMap();
     const state = parseState(req);
 
-    // Support both legacy and vNext field names
-    const relationship =
-      state.relationship_axis?.value ??
-      state.relationship?.value;
-
+    const relationship = state.relationship_axis?.value ?? state.relationship?.value;
     const intent = state.intent?.value;
     const tone = state.tone?.value;
     const format = state.format?.value;
@@ -412,9 +384,7 @@ module.exports = async function handler(req, res) {
       state.paywall?.package ??
       state.context?.package;
 
-    const risk_scan =
-      state.risk_scan ??
-      state.context?.risk_scan;
+    const risk_scan = state.risk_scan ?? state.context?.risk_scan;
 
     assertEnum("relationship", relationship, ENUMS.relationship);
     assertEnum("intent", intent, ENUMS.intent);
@@ -466,21 +436,22 @@ module.exports = async function handler(req, res) {
 
     const user = buildUserPrompt({ rawContext, max_chars: control.max_chars });
 
-    const { model, temperature, allowTemp } = pickModelAndTemp(control);
-    // ✅ DEBUG: model / temperature decision
+    const model = pickModel(control);
+
+    // ✅ DEBUG (model routing snapshot)
     console.log("cb_model_selected", {
       model,
-      allowTemp,
-      temperature: allowTemp ? temperature : "(omitted)",
       record_safe_required: control.record_safe_required,
       pkg,
       format,
       relationship,
       intent,
       risk_scan,
+      temperature: "(omitted)",
     });
+
     // Primary single call
-    let text = await callLLM({ model, temperature, system, user, allowTemp });
+    let text = await callLLM({ model, system, user });
 
     // Parse + validate
     let obj;
@@ -488,17 +459,13 @@ module.exports = async function handler(req, res) {
       obj = JSON.parse(text);
       validateJsonResult(obj, pkgSchema);
     } catch {
-      // Optional repair (rare; keeps UX stable)
       const repairSystem = buildRepairSystem({ schemaStr, allowedKeys: pkgSchema.keys });
       const repairUser = `Fix this into valid JSON only:\n\n${text}`;
 
-      // Repair should be deterministic: do NOT send temperature override
       const repaired = await callLLM({
         model,
-        temperature: 0.0,
         system: repairSystem,
         user: repairUser,
-        allowTemp: false,
       });
 
       try {
