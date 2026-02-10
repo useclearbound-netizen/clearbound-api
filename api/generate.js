@@ -367,6 +367,8 @@ function parseState(req) {
  * Handler
  * -------------------------- */
 module.exports = async function handler(req, res) {
+  const t0 = Date.now(); // ⏱️ 전체 시작 시점
+
   try {
     const allowOrigin = process.env.ALLOW_ORIGIN || "*";
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -374,12 +376,22 @@ module.exports = async function handler(req, res) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+    }
 
+    /* ---------- Guideline load ---------- */
     const GUIDELINE_MAP = await loadGuidelineMap();
+    const t1 = Date.now();
+    console.log("cb_timing_guideline_ms", t1 - t0);
+
     const state = parseState(req);
 
-    const relationship = state.relationship_axis?.value ?? state.relationship?.value;
+    /* ---------- State extraction ---------- */
+    const relationship =
+      state.relationship_axis?.value ??
+      state.relationship?.value;
+
     const intent = state.intent?.value;
     const tone = state.tone?.value;
     const format = state.format?.value;
@@ -389,8 +401,11 @@ module.exports = async function handler(req, res) {
       state.paywall?.package ??
       state.context?.package;
 
-    const risk_scan = state.risk_scan ?? state.context?.risk_scan;
+    const risk_scan =
+      state.risk_scan ??
+      state.context?.risk_scan;
 
+    /* ---------- Validation ---------- */
     assertEnum("relationship", relationship, ENUMS.relationship);
     assertEnum("intent", intent, ENUMS.intent);
     assertEnum("tone", tone, ENUMS.tone);
@@ -399,11 +414,13 @@ module.exports = async function handler(req, res) {
     assertEnum("risk_scan.impact", risk_scan?.impact, ENUMS.impact);
     assertEnum("risk_scan.continuity", risk_scan?.continuity, ENUMS.continuity);
 
+    /* ---------- Control flags ---------- */
     const control = computeControlFlags({ risk_scan, format, intent, tone });
 
     const CONTEXT_MAX = Number(process.env.CB_CONTEXT_MAX_CHARS || 1400);
     const rawContext = clampText(state.context?.text ?? "", CONTEXT_MAX);
 
+    /* ---------- Guideline resolution ---------- */
     const intentGuide = GUIDELINE_MAP.intent?.[intent];
     if (!intentGuide) throw new Error(`Missing intent guide: ${intent}`);
 
@@ -411,8 +428,11 @@ module.exports = async function handler(req, res) {
       ? GUIDELINE_MAP.record_safe_variant?.[relationship]
       : GUIDELINE_MAP.relationship?.[relationship];
 
-    if (!relationGuide) throw new Error(`Missing relationship guide: ${relationship}`);
+    if (!relationGuide) {
+      throw new Error(`Missing relationship guide: ${relationship}`);
+    }
 
+    /* ---------- Prompt assembly ---------- */
     const pkgSchema = pkgSchemaFor(pkg);
     const schemaStr = jsonSchemaString(pkgSchema);
 
@@ -422,7 +442,13 @@ module.exports = async function handler(req, res) {
       tone_micro: buildToneMicroStyle(control),
     };
 
-    const fewshotExample = pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format });
+    const fewshotExample = pickFewshot({
+      GUIDELINE_MAP,
+      relationship,
+      intent,
+      control,
+      format,
+    });
 
     const system = buildSystemPrompt({
       pkg,
@@ -439,39 +465,56 @@ module.exports = async function handler(req, res) {
       fewshotExample,
     });
 
-    const user = buildUserPrompt({ rawContext, max_chars: control.max_chars });
+    const user = buildUserPrompt({
+      rawContext,
+      max_chars: control.max_chars,
+    });
 
-    const model = pickModel(control);
+    const { model, temperature, allowTemp } = pickModelAndTemp(control);
 
-    // DEBUG: routing snapshot (helps verify cost policy in runtime logs)
+    // 🔍 운영 디버그 (비용/품질 확인용)
     console.log("cb_model_selected", {
       model,
+      temperature: allowTemp ? temperature : "(omitted)",
       record_safe_required: control.record_safe_required,
-      high_risk_model_required: control.high_risk_model_required,
       pkg,
       format,
       relationship,
       intent,
       risk_scan,
-      temperature: "(omitted)",
     });
 
-    // Primary single call
-    let text = await callLLM({ model, system, user });
+    /* ---------- LLM call ---------- */
+    let text = await callLLM({
+      model,
+      temperature,
+      system,
+      user,
+      allowTemp,
+    });
 
-    // Parse + validate
+    const t2 = Date.now();
+    console.log("cb_timing_llm_ms", t2 - t1);
+
+    /* ---------- Parse + validate ---------- */
     let obj;
     try {
       obj = JSON.parse(text);
       validateJsonResult(obj, pkgSchema);
     } catch {
-      const repairSystem = buildRepairSystem({ schemaStr, allowedKeys: pkgSchema.keys });
+      const repairSystem = buildRepairSystem({
+        schemaStr,
+        allowedKeys: pkgSchema.keys,
+      });
+
       const repairUser = `Fix this into valid JSON only:\n\n${text}`;
 
       const repaired = await callLLM({
         model,
+        temperature: 0,
         system: repairSystem,
         user: repairUser,
+        allowTemp: true,
       });
 
       try {
@@ -482,8 +525,11 @@ module.exports = async function handler(req, res) {
       }
     }
 
+    console.log("cb_timing_total_ms", Date.now() - t0);
     return res.status(200).json({ ok: true, ...obj });
+
   } catch (err) {
+    console.log("cb_timing_total_ms_error", Date.now() - t0);
     return res.status(500).json({
       ok: false,
       error: "GENERATION_FAILED",
