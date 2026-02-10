@@ -1,116 +1,61 @@
 // /api/generate.js
 // ClearBound — Vercel Serverless API (vNext)
-// 3-PASS Stable Pipeline (package-gated)
+// 3-PASS Stable Pipeline (kept)
 // Pass A: state -> canonical
-// Pass B: canonical -> layer1 (deterministic control JSON)
-// Pass C: {canonical, layer1} -> final deliverables JSON (ONLY what package requires)
+// Pass B: canonical -> layer1 (internal minimal safety analysis)
+// Pass C: {canonical, layer1, requested_outputs} -> final deliverables JSON
 //
-// Key fixes:
-// ✅ Package-gated Pass C prompts (prevents "email but analysis shows" bugs)
-// ✅ Post-enforce output fields by package (hard guarantee)
-// ✅ Lazy-fetch only needed output prompts (speed)
-// ✅ More robust JSON extraction (reduces pass missing canonical/layer1)
-// ✅ Optional timeouts for fetch/OpenAI calls
+// vNext Fix:
+// - Enforce package-based output limits (ONLY generate requested fields)
+// - Include ONLY relevant output prompts in Pass C
+// - Server-side strip of disallowed fields (hard guarantee)
+// - Better schema validation per package
 
 const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const promptCache =
   globalThis.__CB_PROMPT_CACHE__ || (globalThis.__CB_PROMPT_CACHE__ = new Map());
 
-function now() {
-  return Date.now();
-}
-function cacheKey(repo, ref, path) {
-  return `${repo}@${ref}:${path}`;
-}
+function now() { return Date.now(); }
+function cacheKey(repo, ref, path) { return `${repo}@${ref}:${path}`; }
+
 function getCached(key) {
   const hit = promptCache.get(key);
   if (!hit) return null;
-  if (hit.expiresAt <= now()) {
-    promptCache.delete(key);
-    return null;
-  }
+  if (hit.expiresAt <= now()) { promptCache.delete(key); return null; }
   return hit.value;
 }
-function setCached(key, value, ttlMs) {
-  promptCache.set(key, { value, expiresAt: now() + ttlMs });
-}
+function setCached(key, value, ttlMs) { promptCache.set(key, { value, expiresAt: now() + ttlMs }); }
+
 function pickEnv(name, fallback = null) {
   const v = process.env[name];
   return v == null || v === "" ? fallback : v;
 }
+
 function jsonFail(res, status, stage, extra = {}) {
   return res.status(status).json({ ok: false, stage, ...extra });
 }
-function asLowerId(v) {
-  return String(v || "").trim().toLowerCase();
-}
 
-function withTimeout(ms) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(new Error("timeout")), ms);
-  return { controller, cancel: () => clearTimeout(t) };
-}
+function asLowerId(v) { return String(v || "").trim().toLowerCase(); }
 
-async function fetchTextWithCache(url, key, ttlMs, timeoutMs = 8000) {
+async function fetchTextWithCache(url, key, ttlMs) {
   const cached = getCached(key);
   if (cached != null) return cached;
 
-  const { controller, cancel } = withTimeout(timeoutMs);
-  try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { "Cache-Control": "no-cache" },
-      signal: controller.signal,
-    });
+  const r = await fetch(url, { method: "GET", headers: { "Cache-Control": "no-cache" } });
+  const text = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`PROMPT_FETCH_FAIL:${r.status}:${url}:${text.slice(0, 200)}`);
 
-    const text = await r.text().catch(() => "");
-    if (!r.ok) {
-      throw new Error(`PROMPT_FETCH_FAIL:${r.status}:${url}:${text.slice(0, 200)}`);
-    }
-
-    setCached(key, text, ttlMs);
-    return text;
-  } finally {
-    cancel();
-  }
+  setCached(key, text, ttlMs);
+  return text;
 }
 
 function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-// Extract the first JSON object from a possibly noisy text response
-function extractJsonObject(text) {
-  if (typeof text !== "string") return null;
-  const t = text.trim();
-  if (!t) return null;
-
-  // Fast path
-  const direct = safeJsonParse(t);
-  if (direct && typeof direct === "object") return direct;
-
-  // Try to locate JSON boundaries
-  const first = t.indexOf("{");
-  const last = t.lastIndexOf("}");
-  if (first >= 0 && last > first) {
-    const slice = t.slice(first, last + 1);
-    const obj = safeJsonParse(slice);
-    if (obj && typeof obj === "object") return obj;
-  }
-  return null;
+  try { return JSON.parse(text); } catch { return null; }
 }
 
 function extractOutputText(data) {
-  // Prefer convenience field if present
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
+  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
 
-  // Otherwise extract from structured output array
   const out = data?.output;
   if (!Array.isArray(out)) return "";
 
@@ -125,49 +70,33 @@ function extractOutputText(data) {
   return acc.trim();
 }
 
-async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce, timeoutMs = 20000 }) {
+async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
   const url = "https://api.openai.com/v1/responses";
 
   const attempt = async () => {
-    const { controller, cancel } = withTimeout(timeoutMs);
-    try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      const raw = await resp.text().catch(() => "");
-      const data = safeJsonParse(raw);
-
-      return { ok: resp.ok, status: resp.status, data, raw };
-    } finally {
-      cancel();
-    }
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const raw = await resp.text().catch(() => "");
+    const data = safeJsonParse(raw);
+    return { ok: resp.ok, status: resp.status, data, raw };
   };
 
-  // Attempt 1
-  let r1 = await attempt();
+  const r1 = await attempt();
   if (r1.ok) return r1;
 
-  // Retry once on likely transient errors
   const transient = [408, 429, 500, 502, 503, 504].includes(r1.status);
   if (retryOnce && transient) {
     await new Promise((resolve) => setTimeout(resolve, 250));
-    const r2 = await attempt();
-    return r2;
+    return await attempt();
   }
-
   return r1;
 }
 
-function isNonEmptyString(v) {
-  return typeof v === "string" && v.trim().length > 0;
-}
+function isNonEmptyString(v) { return typeof v === "string" && v.trim().length > 0; }
+
 function hasValueLike(obj) {
   if (!obj || typeof obj !== "object") return false;
   if ("value" in obj) {
@@ -203,7 +132,6 @@ function resolveIntentPath(intentId) {
 }
 
 function looksLikeFrontState(state) {
-  // front sends: relationship/target/intent/tone/format/context
   const requiredKeys = ["relationship", "target", "intent", "tone", "format", "context"];
   const missing = requiredKeys.filter((k) => !(k in state));
   return { ok: missing.length === 0, missing };
@@ -240,20 +168,25 @@ function ensureObjectHasKey(obj, key) {
   return obj && typeof obj === "object" && key in obj;
 }
 
+function coerceJsonObjectOrFail(text) {
+  const obj = safeJsonParse(text);
+  if (!obj || typeof obj !== "object") return null;
+  return obj;
+}
+
 function pickModel(passName, formatId) {
-  // Optional per-pass overrides
   const base = pickEnv("OPENAI_MODEL", "gpt-4.1-mini");
   if (passName === "passA_normalize") return pickEnv("OPENAI_MODEL_NORMALIZE", base);
   if (passName === "passB_layer1") return pickEnv("OPENAI_MODEL_LAYER1", base);
-
-  // Pass C: output generation (can be per type if you want)
-  const f = asLowerId(formatId);
-  if (f === "email") return pickEnv("OPENAI_MODEL_EMAIL", base);
-  return pickEnv("OPENAI_MODEL_MESSAGE", base);
+  if (passName === "passC_assemble") {
+    const f = asLowerId(formatId);
+    if (f === "email") return pickEnv("OPENAI_MODEL_EMAIL", base);
+    return pickEnv("OPENAI_MODEL_MESSAGE", base);
+  }
+  return base;
 }
 
 function promptHeader(passName) {
-  // Strong contract enforcement per pass
   return [
     "CRITICAL OUTPUT CONTRACT:",
     "- Return ONLY valid JSON.",
@@ -264,47 +197,83 @@ function promptHeader(passName) {
   ].join("\n");
 }
 
-// Package gating helpers
+/** ----------------------------
+ * Package-based output contract
+ * ---------------------------- */
 function normalizePackageId(pkg) {
   const p = asLowerId(pkg);
-  // allowed: message|email|analysis_message|analysis_email|total
-  if (["message", "email", "analysis_message", "analysis_email", "total"].includes(p)) return p;
-  return null;
+  const allowed = new Set(["message", "email", "analysis_message", "analysis_email", "total"]);
+  return allowed.has(p) ? p : null;
 }
 
-function allowedOutputsByPackage(pkg) {
+function requestedOutputsForPackage(pkg) {
+  // 대표님 원칙 그대로:
+  // message -> message_text
+  // email -> email_text
+  // analysis_email -> analysis_report + email_text
+  // analysis_message -> analysis_report + message_text
+  // total -> analysis_report + message_text + email_text
+  switch (pkg) {
+    case "message":
+      return { wantMessage: true, wantEmail: false, wantAnalysis: false };
+    case "email":
+      return { wantMessage: false, wantEmail: true, wantAnalysis: false };
+    case "analysis_message":
+      return { wantMessage: true, wantEmail: false, wantAnalysis: true };
+    case "analysis_email":
+      return { wantMessage: false, wantEmail: true, wantAnalysis: true };
+    case "total":
+      return { wantMessage: true, wantEmail: true, wantAnalysis: true };
+    default:
+      return { wantMessage: false, wantEmail: false, wantAnalysis: false };
+  }
+}
+
+function enforceFinalSchemaByPackage(finalObj, pkg) {
   const p = normalizePackageId(pkg);
-  if (p === "message") return { message: true, email: false, analysis: false };
-  if (p === "email") return { message: false, email: true, analysis: false };
-  if (p === "analysis_message") return { message: true, email: false, analysis: true };
-  if (p === "analysis_email") return { message: false, email: true, analysis: true };
-  if (p === "total") return { message: true, email: true, analysis: true };
-  // null/unknown => be strict (nothing)
-  return { message: false, email: false, analysis: false };
+  if (!p) return { ok: false, error: "invalid_package" };
+
+  const need = requestedOutputsForPackage(p);
+
+  // Keep only allowed keys (hard guarantee)
+  const keep = new Set(["package", "message_text", "email_text", "analysis_report", "notes", "safety_disclaimer"]);
+  for (const k of Object.keys(finalObj)) {
+    if (!keep.has(k)) delete finalObj[k];
+  }
+
+  // Force package to the requested one (don’t allow model to drift)
+  finalObj.package = p;
+
+  // Strip disallowed payloads
+  if (!need.wantMessage) delete finalObj.message_text;
+  if (!need.wantEmail) delete finalObj.email_text;
+  if (!need.wantAnalysis) delete finalObj.analysis_report;
+
+  // Validate required fields
+  if (!isNonEmptyString(finalObj.safety_disclaimer)) {
+    return { ok: false, error: "missing_safety_disclaimer" };
+  }
+  if (need.wantMessage && !isNonEmptyString(finalObj.message_text)) {
+    return { ok: false, error: "missing_message_text" };
+  }
+  if (need.wantEmail && !isNonEmptyString(finalObj.email_text)) {
+    return { ok: false, error: "missing_email_text" };
+  }
+  if (need.wantAnalysis && !isNonEmptyString(finalObj.analysis_report)) {
+    return { ok: false, error: "missing_analysis_report" };
+  }
+
+  return { ok: true };
 }
 
-function enforceFinalByPackage(finalObj, pkg) {
-  const allow = allowedOutputsByPackage(pkg);
-  const out = { ...finalObj };
-
-  // hard guarantee of these keys existing
-  if (!("package" in out)) out.package = normalizePackageId(pkg) || null;
-  else out.package = normalizePackageId(out.package) || normalizePackageId(pkg) || null;
-
-  if (!("safety_disclaimer" in out)) out.safety_disclaimer = "";
-
-  // normalize missing keys to null
-  if (!("message_text" in out)) out.message_text = null;
-  if (!("email_text" in out)) out.email_text = null;
-  if (!("analysis_report" in out)) out.analysis_report = null;
-  if (!("notes" in out)) out.notes = null;
-
-  // enforce gating
-  if (!allow.message) out.message_text = null;
-  if (!allow.email) out.email_text = null;
-  if (!allow.analysis) out.analysis_report = null;
-
-  return out;
+function pickPackageFromFrontState(state) {
+  // front sends: state.context.paywall.package (from your adapter)
+  const pkg =
+    state?.context?.paywall?.package ||
+    state?.context?.paywall?.package_id ||
+    state?.context?.package ||
+    state?.package;
+  return normalizePackageId(pkg) || "message"; // safe default
 }
 
 export default async function handler(req, res) {
@@ -320,7 +289,6 @@ export default async function handler(req, res) {
   const fail = (status, stage, extra = {}) => jsonFail(res, status, stage, extra);
 
   try {
-    // Body validation
     const body = req.body || {};
     const state = body.state;
 
@@ -330,9 +298,7 @@ export default async function handler(req, res) {
 
     const { ok: keysOk, missing } = looksLikeFrontState(state);
     if (!keysOk) {
-      return fail(400, "validate_state_keys", {
-        error: `Missing fields: ${missing.join(", ")}`,
-      });
+      return fail(400, "validate_state_keys", { error: `Missing fields: ${missing.join(", ")}` });
     }
 
     const shape = validateFrontStateShape(state);
@@ -342,6 +308,10 @@ export default async function handler(req, res) {
         details: { missing: shape.shapeMissing },
       });
     }
+
+    // Package enforcement inputs
+    const pkg = pickPackageFromFrontState(state);
+    const requested = requestedOutputsForPackage(pkg);
 
     // Env
     const OPENAI_API_KEY = pickEnv("OPENAI_API_KEY");
@@ -357,21 +327,23 @@ export default async function handler(req, res) {
     const includeQa = String(pickEnv("INCLUDE_QA_RULES", "1")) === "1";
     const retryOnce = String(pickEnv("OPENAI_RETRY_ONCE", "1")) === "1";
 
-    // GitHub raw URL builder
-    const ghRaw = (path) =>
-      `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
+    const ghRaw = (path) => `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
 
-    // Fixed shared prompt paths
+    // Fixed prompt paths
     const normalizePath = "prompts/normalize/normalize_state_to_canonical.prompt.md";
     const layer1Path = "prompts/layer1/layer1_control.prompt.md";
     const assemblePath = "prompts/assemble/assemble_generate.prompt.md";
+
+    // Output prompts (load ONLY what we need)
     const outputMessagePath = "prompts/output/message.prompt.md";
     const outputEmailPath = "prompts/output/email.prompt.md";
     const outputAnalysisPath = "prompts/output/analysis_report.prompt.md";
+
     const qaCorePath = "qa/rules/core.yaml";
 
-    // Fetch only the prompts needed up-front (normalize, layer1, assemble, optional QA)
-    let normalizePrompt, layer1Prompt, assemblePrompt, qaRulesPrompt;
+    // Fetch shared prompts early
+    let normalizePrompt, layer1Prompt, assemblePrompt;
+    let outMsgPrompt = "", outEmailPrompt = "", outAnalysisPrompt = "", qaRulesPrompt = "";
 
     try {
       const fetches = [
@@ -379,6 +351,11 @@ export default async function handler(req, res) {
         ["layer1", layer1Path],
         ["assemble", assemblePath],
       ];
+
+      if (requested.wantMessage) fetches.push(["out_msg", outputMessagePath]);
+      if (requested.wantEmail) fetches.push(["out_email", outputEmailPath]);
+      if (requested.wantAnalysis) fetches.push(["out_analysis", outputAnalysisPath]);
+
       if (includeQa) fetches.push(["qa", qaCorePath]);
 
       const results = await Promise.all(
@@ -394,6 +371,9 @@ export default async function handler(req, res) {
       normalizePrompt = byLabel.normalize;
       layer1Prompt = byLabel.layer1;
       assemblePrompt = byLabel.assemble;
+      outMsgPrompt = byLabel.out_msg || "";
+      outEmailPrompt = byLabel.out_email || "";
+      outAnalysisPrompt = byLabel.out_analysis || "";
       qaRulesPrompt = byLabel.qa || "";
     } catch (e) {
       return fail(502, "prompt_fetch", { error: String(e?.message || e) });
@@ -415,13 +395,7 @@ export default async function handler(req, res) {
       max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_NORMALIZE", "700")),
     };
 
-    const a = await callOpenAIWithOptionalRetry({
-      apiKey: OPENAI_API_KEY,
-      payload: passA_payload,
-      retryOnce,
-      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
-    });
-
+    const a = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passA_payload, retryOnce });
     if (!a.ok) {
       return fail(502, "passA_openai", {
         error: "OpenAI failed (Pass A)",
@@ -431,33 +405,18 @@ export default async function handler(req, res) {
     }
 
     const passA_text = extractOutputText(a.data);
-    const passA_obj = extractJsonObject(passA_text);
+    const passA_obj = coerceJsonObjectOrFail(passA_text);
 
     if (!passA_obj || !ensureObjectHasKey(passA_obj, "canonical")) {
       return fail(502, "passA_missing_canonical", {
         error: "Pass A missing `canonical` object",
-        details: {
-          snippet: (passA_text || "").slice(0, 500),
-          keys: passA_obj ? Object.keys(passA_obj) : null,
-        },
+        details: { snippet: (passA_text || "").slice(0, 400), keys: passA_obj ? Object.keys(passA_obj) : null },
       });
     }
 
     const canonical = passA_obj.canonical;
     if (!canonical || typeof canonical !== "object") {
       return fail(502, "passA_bad_canonical", { error: "Invalid canonical payload" });
-    }
-
-    // Determine package early (canonical.package preferred; fallback to front paywall package)
-    const packageFront = normalizePackageId(state?.context?.paywall?.package);
-    const packageCanonical = normalizePackageId(canonical?.package);
-    const packageId = packageCanonical || packageFront;
-
-    if (!packageId) {
-      return fail(400, "validate_package", {
-        error: "Missing or invalid package (canonical.package or state.context.paywall.package)",
-        details: { canonical_package: canonical?.package || null, front_package: packageFront || null },
-      });
     }
 
     // -----------------------
@@ -476,13 +435,7 @@ export default async function handler(req, res) {
       max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_LAYER1", "900")),
     };
 
-    const b = await callOpenAIWithOptionalRetry({
-      apiKey: OPENAI_API_KEY,
-      payload: passB_payload,
-      retryOnce,
-      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
-    });
-
+    const b = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passB_payload, retryOnce });
     if (!b.ok) {
       return fail(502, "passB_openai", {
         error: "OpenAI failed (Pass B)",
@@ -492,15 +445,12 @@ export default async function handler(req, res) {
     }
 
     const passB_text = extractOutputText(b.data);
-    const passB_obj = extractJsonObject(passB_text);
+    const passB_obj = coerceJsonObjectOrFail(passB_text);
 
     if (!passB_obj || !ensureObjectHasKey(passB_obj, "layer1")) {
       return fail(502, "passB_missing_layer1", {
         error: "Pass B missing `layer1` object",
-        details: {
-          snippet: (passB_text || "").slice(0, 500),
-          keys: passB_obj ? Object.keys(passB_obj) : null,
-        },
+        details: { snippet: (passB_text || "").slice(0, 400), keys: passB_obj ? Object.keys(passB_obj) : null },
       });
     }
 
@@ -510,11 +460,11 @@ export default async function handler(req, res) {
     }
 
     // -----------------------
-    // PASS C: {canonical, layer1} -> final deliverables JSON
-    // (Package-gated prompts + post-enforce)
+    // PASS C: {canonical, layer1, requested_outputs} -> final deliverables JSON
     // -----------------------
     const intentId = asLowerId(canonical.intent);
     const intentPath = resolveIntentPath(intentId);
+
     if (!intentPath) {
       return fail(400, "validate_ids", {
         error: "Invalid intent value (canonical.intent)",
@@ -532,62 +482,28 @@ export default async function handler(req, res) {
       return fail(502, "prompt_fetch_intent", { error: String(e?.message || e) });
     }
 
-    // Fetch ONLY output prompts needed for this package
-    const allow = allowedOutputsByPackage(packageId);
-    let outMsgPrompt = "";
-    let outEmailPrompt = "";
-    let outAnalysisPrompt = "";
-
-    try {
-      const fetches = [];
-      if (allow.message) fetches.push(["out_msg", outputMessagePath]);
-      if (allow.email) fetches.push(["out_email", outputEmailPath]);
-      if (allow.analysis) fetches.push(["out_analysis", outputAnalysisPath]);
-
-      if (fetches.length) {
-        const results = await Promise.all(
-          fetches.map(async ([label, path]) => {
-            const url = ghRaw(path);
-            const key = cacheKey(PROMPTS_REPO, PROMPTS_REF, path);
-            const text = await fetchTextWithCache(url, key, ttlMs);
-            return [label, text];
-          })
-        );
-        const byLabel = Object.fromEntries(results);
-        outMsgPrompt = byLabel.out_msg || "";
-        outEmailPrompt = byLabel.out_email || "";
-        outAnalysisPrompt = byLabel.out_analysis || "";
-      }
-    } catch (e) {
-      return fail(502, "prompt_fetch_outputs", { error: String(e?.message || e) });
-    }
-
-    // Build Pass C system with STRICT package gating
+    // Build Pass C system with ONLY required output prompts
     const systemParts = [
       promptHeader("passC_assemble"),
       "",
       "Return ONLY the final JSON deliverables. No explanations.",
-      `Package gate: ${packageId}`,
-      "IMPORTANT:",
-      "- Output ONLY the fields allowed by the package gate.",
-      "- If package is email, do NOT output analysis_report or message_text.",
-      "- If package is message, do NOT output analysis_report or email_text.",
-      "- If package is analysis_email, output ONLY analysis_report + email_text.",
-      "- If package is analysis_message, output ONLY analysis_report + message_text.",
-      "- If package is total, output all three.",
+      "",
+      `REQUESTED PACKAGE: ${pkg}`,
+      `REQUESTED OUTPUTS: ${JSON.stringify(requested)}`,
+      "",
+      "Hard rules:",
+      "- If requested.wantAnalysis is false: DO NOT include analysis_report.",
+      "- If requested.wantMessage is false: DO NOT include message_text.",
+      "- If requested.wantEmail is false: DO NOT include email_text.",
+      "- Always include: package, safety_disclaimer.",
+      "- package MUST equal REQUESTED PACKAGE.",
       "",
       intentPrompt,
     ];
 
-    if (allow.message) {
-      systemParts.push("", "=== OUTPUT RULES: MESSAGE ===", outMsgPrompt);
-    }
-    if (allow.email) {
-      systemParts.push("", "=== OUTPUT RULES: EMAIL ===", outEmailPrompt);
-    }
-    if (allow.analysis) {
-      systemParts.push("", "=== OUTPUT RULES: ANALYSIS REPORT ===", outAnalysisPrompt);
-    }
+    if (requested.wantMessage) systemParts.push("", "=== OUTPUT RULES: MESSAGE ===", outMsgPrompt);
+    if (requested.wantEmail) systemParts.push("", "=== OUTPUT RULES: EMAIL ===", outEmailPrompt);
+    if (requested.wantAnalysis) systemParts.push("", "=== OUTPUT RULES: ANALYSIS REPORT ===", outAnalysisPrompt);
 
     systemParts.push("", assemblePrompt);
 
@@ -596,11 +512,10 @@ export default async function handler(req, res) {
     }
 
     const passC_system = systemParts.join("\n");
+
+    // Feed requested outputs into user content so it’s “visible” in both system+user
     const passC_user = JSON.stringify(
-      {
-        canonical: { ...canonical, package: packageId }, // ensure consistent
-        layer1,
-      },
+      { canonical, layer1, requested, package: pkg },
       null,
       2
     );
@@ -612,18 +527,18 @@ export default async function handler(req, res) {
         { role: "system", content: passC_system },
         { role: "user", content: passC_user },
       ],
-      // Lower temp helps stability; speed comes mostly from gating prompts + fewer tokens
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.2")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS", allow.analysis ? "900" : "650")),
+      // keep creativity moderate, but not too high
+      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.3")),
+      // reduce output tokens when fewer outputs requested
+      max_output_tokens: Number(
+        pickEnv(
+          "OPENAI_MAX_OUTPUT_TOKENS",
+          requested.wantAnalysis ? "900" : "450"
+        )
+      ),
     };
 
-    const c = await callOpenAIWithOptionalRetry({
-      apiKey: OPENAI_API_KEY,
-      payload: passC_payload,
-      retryOnce,
-      timeoutMs: Number(pickEnv("OPENAI_TIMEOUT_MS", "20000")),
-    });
-
+    const c = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passC_payload, retryOnce });
     if (!c.ok) {
       return fail(502, "passC_openai", {
         error: "OpenAI failed (Pass C)",
@@ -640,18 +555,15 @@ export default async function handler(req, res) {
       });
     }
 
-    const finalObjRaw = extractJsonObject(passC_text);
-    if (!finalObjRaw || typeof finalObjRaw !== "object") {
+    const finalObj = safeJsonParse(passC_text);
+    if (!finalObj || typeof finalObj !== "object") {
       return fail(502, "passC_non_json", {
         error: "Final output is not valid JSON",
         details: { snippet: passC_text.slice(0, 600) },
       });
     }
 
-    // Post-enforce by package (hard guarantee)
-    const finalObj = enforceFinalByPackage(finalObjRaw, packageId);
-
-    // Final minimal required keys
+    // Must contain minimum required fields
     if (!("package" in finalObj) || !("safety_disclaimer" in finalObj)) {
       return fail(502, "passC_bad_schema", {
         error: "Final JSON missing required fields",
@@ -659,12 +571,22 @@ export default async function handler(req, res) {
       });
     }
 
+    // HARD ENFORCEMENT by package (strip + validate)
+    const enforced = enforceFinalSchemaByPackage(finalObj, pkg);
+    if (!enforced.ok) {
+      return fail(502, "passC_package_contract_failed", {
+        error: "Final JSON violates package output contract",
+        details: { package: pkg, reason: enforced.error, keys: Object.keys(finalObj) },
+      });
+    }
+
     return res.status(200).json({
       ok: true,
-      result_text: JSON.stringify(finalObj), // front expects a string
+      result_text: JSON.stringify(finalObj), // IMPORTANT: stringify normalized/stripped object
       meta: {
-        pipeline: "3-pass-package-gated",
-        package: packageId,
+        pipeline: "3-pass",
+        package: pkg,
+        requested,
         model: passC_payload.model,
         prompts_repo: PROMPTS_REPO,
         prompts_ref: PROMPTS_REF,
