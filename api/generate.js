@@ -467,7 +467,18 @@ module.exports = async function handler(req, res) {
     const user = buildUserPrompt({ rawContext, max_chars: control.max_chars });
 
     const { model, temperature, allowTemp } = pickModelAndTemp(control);
-
+    // ✅ DEBUG: model / temperature decision
+    console.log("cb_model_selected", {
+      model,
+      allowTemp,
+      temperature: allowTemp ? temperature : "(omitted)",
+      record_safe_required: control.record_safe_required,
+      pkg,
+      format,
+      relationship,
+      intent,
+      risk_scan,
+    });
     // Primary single call
     let text = await callLLM({ model, temperature, system, user, allowTemp });
 
