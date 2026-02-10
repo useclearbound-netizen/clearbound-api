@@ -388,10 +388,7 @@ module.exports = async function handler(req, res) {
     const state = parseState(req);
 
     /* ---------- State extraction ---------- */
-    const relationship =
-      state.relationship_axis?.value ??
-      state.relationship?.value;
-
+    const relationship = state.relationship_axis?.value ?? state.relationship?.value;
     const intent = state.intent?.value;
     const tone = state.tone?.value;
     const format = state.format?.value;
@@ -401,9 +398,7 @@ module.exports = async function handler(req, res) {
       state.paywall?.package ??
       state.context?.package;
 
-    const risk_scan =
-      state.risk_scan ??
-      state.context?.risk_scan;
+    const risk_scan = state.risk_scan ?? state.context?.risk_scan;
 
     /* ---------- Validation ---------- */
     assertEnum("relationship", relationship, ENUMS.relationship);
@@ -470,28 +465,24 @@ module.exports = async function handler(req, res) {
       max_chars: control.max_chars,
     });
 
-    const { model, temperature, allowTemp } = pickModelAndTemp(control);
+    /* ---------- Model routing (no temperature) ---------- */
+    const model = pickModel(control);
 
     // 🔍 운영 디버그 (비용/품질 확인용)
     console.log("cb_model_selected", {
       model,
-      temperature: allowTemp ? temperature : "(omitted)",
       record_safe_required: control.record_safe_required,
+      high_risk_model_required: control.high_risk_model_required,
       pkg,
       format,
       relationship,
       intent,
       risk_scan,
+      temperature: "(omitted)",
     });
 
     /* ---------- LLM call ---------- */
-    let text = await callLLM({
-      model,
-      temperature,
-      system,
-      user,
-      allowTemp,
-    });
+    let text = await callLLM({ model, system, user });
 
     const t2 = Date.now();
     console.log("cb_timing_llm_ms", t2 - t1);
@@ -502,19 +493,14 @@ module.exports = async function handler(req, res) {
       obj = JSON.parse(text);
       validateJsonResult(obj, pkgSchema);
     } catch {
-      const repairSystem = buildRepairSystem({
-        schemaStr,
-        allowedKeys: pkgSchema.keys,
-      });
-
+      // Optional repair (rare)
+      const repairSystem = buildRepairSystem({ schemaStr, allowedKeys: pkgSchema.keys });
       const repairUser = `Fix this into valid JSON only:\n\n${text}`;
 
       const repaired = await callLLM({
-        model,
-        temperature: 0,
+        model, // keep same model for consistency
         system: repairSystem,
         user: repairUser,
-        allowTemp: true,
       });
 
       try {
