@@ -302,15 +302,22 @@ function validateJsonResult(obj, pkgSchema) {
   return true;
 }
 
-async function callLLM({ model, temperature, system, user }) {
-  const r = await client.chat.completions.create({
+async function callLLM({ model, temperature, system, user, allowTemp }) {
+  // FIX: 일부 모델은 temperature override를 지원하지 않음.
+  // - allowTemp=false인 경우 temperature를 payload에서 아예 제거한다.
+  const payload = {
     model,
-    temperature,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-  });
+  };
+
+  if (allowTemp && typeof temperature === "number" && !Number.isNaN(temperature)) {
+    payload.temperature = temperature;
+  }
+
+  const r = await client.chat.completions.create(payload);
   return r.choices?.[0]?.message?.content ?? "";
 }
 
@@ -356,7 +363,10 @@ function pickModelAndTemp(control) {
     ? Number(process.env.CB_TEMPERATURE_HIGH_RISK ?? 0.2)
     : Number(process.env.CB_TEMPERATURE_DEFAULT ?? 0.4);
 
-  return { model, temperature };
+  // FIX: DEFAULT 모델에서는 temperature override를 쓰지 않는다.
+  const allowTemp = !!control.record_safe_required;
+
+  return { model, temperature, allowTemp };
 }
 
 /* ---------------------------
@@ -456,10 +466,10 @@ module.exports = async function handler(req, res) {
 
     const user = buildUserPrompt({ rawContext, max_chars: control.max_chars });
 
-    const { model, temperature } = pickModelAndTemp(control);
+    const { model, temperature, allowTemp } = pickModelAndTemp(control);
 
     // Primary single call
-    let text = await callLLM({ model, temperature, system, user });
+    let text = await callLLM({ model, temperature, system, user, allowTemp });
 
     // Parse + validate
     let obj;
@@ -471,11 +481,13 @@ module.exports = async function handler(req, res) {
       const repairSystem = buildRepairSystem({ schemaStr, allowedKeys: pkgSchema.keys });
       const repairUser = `Fix this into valid JSON only:\n\n${text}`;
 
+      // Repair should be deterministic: do NOT send temperature override
       const repaired = await callLLM({
         model,
         temperature: 0.0,
         system: repairSystem,
         user: repairUser,
+        allowTemp: false,
       });
 
       try {
