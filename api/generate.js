@@ -1,607 +1,497 @@
-// /api/generate.js
-// ClearBound — Vercel Serverless API (vNext)
-// 3-PASS Stable Pipeline (kept)
-// Pass A: state -> canonical
-// Pass B: canonical -> layer1 (internal minimal safety analysis)
-// Pass C: {canonical, layer1, requested_outputs} -> final deliverables JSON
-//
-// vNext Fix:
-// - Enforce package-based output limits (ONLY generate requested fields)
-// - Include ONLY relevant output prompts in Pass C
-// - Server-side strip of disallowed fields (hard guarantee)
-// - Better schema validation per package
+// clearbound-api/api/generate.js
+// vNext single-call pipeline:
+// - Remote GUIDELINE_MAP fetch (+ TTL cache)
+// - Code-based control flags (record-safe, tone ceiling, max chars)
+// - Model routing: DEFAULT vs HIGH_RISK
+// - Strict JSON output gating (+ optional repair call if JSON parse fails)
 
-const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const promptCache =
-  globalThis.__CB_PROMPT_CACHE__ || (globalThis.__CB_PROMPT_CACHE__ = new Map());
+const OpenAI = require("openai");
 
-function now() { return Date.now(); }
-function cacheKey(repo, ref, path) { return `${repo}@${ref}:${path}`; }
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-function getCached(key) {
-  const hit = promptCache.get(key);
-  if (!hit) return null;
-  if (hit.expiresAt <= now()) { promptCache.delete(key); return null; }
-  return hit.value;
-}
-function setCached(key, value, ttlMs) { promptCache.set(key, { value, expiresAt: now() + ttlMs }); }
+/* ---------------------------
+ * Remote GUIDELINE_MAP loader (cached)
+ * -------------------------- */
+let _guidelineCache = null;
+let _guidelineCacheAt = 0;
 
-function pickEnv(name, fallback = null) {
-  const v = process.env[name];
-  return v == null || v === "" ? fallback : v;
-}
+async function loadGuidelineMap() {
+  const url = process.env.CB_GUIDELINE_MAP_URL;
+  if (!url) throw new Error("Missing env: CB_GUIDELINE_MAP_URL");
 
-function jsonFail(res, status, stage, extra = {}) {
-  return res.status(status).json({ ok: false, stage, ...extra });
-}
+  const ttlSec = Number(process.env.CB_GUIDELINE_TTL_SEC || 300);
+  const now = Date.now();
 
-function asLowerId(v) { return String(v || "").trim().toLowerCase(); }
-
-async function fetchTextWithCache(url, key, ttlMs) {
-  const cached = getCached(key);
-  if (cached != null) return cached;
-
-  const r = await fetch(url, { method: "GET", headers: { "Cache-Control": "no-cache" } });
-  const text = await r.text().catch(() => "");
-  if (!r.ok) throw new Error(`PROMPT_FETCH_FAIL:${r.status}:${url}:${text.slice(0, 200)}`);
-
-  setCached(key, text, ttlMs);
-  return text;
-}
-
-function safeJsonParse(text) {
-  try { return JSON.parse(text); } catch { return null; }
-}
-
-function extractOutputText(data) {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
-
-  const out = data?.output;
-  if (!Array.isArray(out)) return "";
-
-  let acc = "";
-  for (const item of out) {
-    const content = item?.content;
-    if (!Array.isArray(content)) continue;
-    for (const c of content) {
-      if (typeof c?.text === "string") acc += c.text;
-    }
+  if (_guidelineCache && now - _guidelineCacheAt < ttlSec * 1000) {
+    return _guidelineCache;
   }
-  return acc.trim();
-}
 
-async function callOpenAIWithOptionalRetry({ apiKey, payload, retryOnce }) {
-  const url = "https://api.openai.com/v1/responses";
+  const resp = await fetch(url, { method: "GET" });
+  if (!resp.ok) throw new Error(`Failed to fetch GUIDELINE_MAP (${resp.status})`);
 
-  const attempt = async () => {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const raw = await resp.text().catch(() => "");
-    const data = safeJsonParse(raw);
-    return { ok: resp.ok, status: resp.status, data, raw };
-  };
+  const json = await resp.json();
 
-  const r1 = await attempt();
-  if (r1.ok) return r1;
-
-  const transient = [408, 429, 500, 502, 503, 504].includes(r1.status);
-  if (retryOnce && transient) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    return await attempt();
+  if (!json?.relationship || !json?.intent) {
+    throw new Error("Invalid GUIDELINE_MAP payload (missing relationship/intent)");
   }
-  return r1;
+
+  _guidelineCache = json;
+  _guidelineCacheAt = now;
+  return json;
 }
 
-function isNonEmptyString(v) { return typeof v === "string" && v.trim().length > 0; }
+/* ---------------------------
+ * Enums & helpers
+ * -------------------------- */
+const ENUMS = {
+  relationship: ["intimate", "personal", "social", "peripheral"],
+  intent: [
+    "push_back",
+    "set_boundary",
+    "clarify_or_correct",
+    "address_issue",
+    "reset_expectations",
+    "make_it_official",
+    "close_the_loop",
+  ],
+  tone: ["calm", "neutral", "firm", "formal"],
+  format: ["message", "email"],
+  package: ["message", "email", "analysis_email", "total"],
+  impact: ["low", "high"],
+  continuity: ["low", "mid", "high"],
+};
 
-function hasValueLike(obj) {
-  if (!obj || typeof obj !== "object") return false;
-  if ("value" in obj) {
-    const v = obj.value;
-    if (typeof v === "string") return v.trim().length > 0;
-    if (v != null) return true;
+function assertEnum(name, value, allowed) {
+  if (!allowed.includes(value)) {
+    const v = value === undefined ? "undefined" : JSON.stringify(value);
+    throw new Error(`Invalid ${name}: ${v}`);
   }
-  return false;
 }
 
-/**
- * vNext prompt paths:
- * - prompts/normalize/normalize_state_to_canonical.prompt.md
- * - prompts/layer1/layer1_control.prompt.md
- * - prompts/intent/<intent>.prompt.md
- * - prompts/output/message.prompt.md
- * - prompts/output/email.prompt.md
- * - prompts/output/analysis_report.prompt.md
- * - prompts/assemble/assemble_generate.prompt.md
- * - qa/rules/core.yaml (optional include)
- */
-function resolveIntentPath(intentId) {
-  const map = {
-    address_issue: "prompts/intent/address_issue.prompt.md",
-    clarify_correct: "prompts/intent/clarify_correct.prompt.md",
-    close_loop: "prompts/intent/close_loop.prompt.md",
-    official: "prompts/intent/official.prompt.md",
-    push_back: "prompts/intent/push_back.prompt.md",
-    reset_expectations: "prompts/intent/reset_expectations.prompt.md",
-    set_boundary: "prompts/intent/set_boundary.prompt.md",
-  };
-  return map[intentId] || null;
+function clampText(s, maxChars) {
+  const t = (s ?? "").toString().trim();
+  return t.length > maxChars ? t.slice(0, maxChars) : t;
 }
 
-function looksLikeFrontState(state) {
-  const requiredKeys = ["relationship", "target", "intent", "tone", "format", "context"];
-  const missing = requiredKeys.filter((k) => !(k in state));
-  return { ok: missing.length === 0, missing };
+function bulletLines(list) {
+  return (list || []).map((x) => `- ${x}`).join("\n");
 }
 
-function validateFrontStateShape(state) {
-  const relationshipOk = hasValueLike(state.relationship);
-  const targetOk = hasValueLike(state.target);
-  const intentOk = hasValueLike(state.intent);
-  const toneOk = hasValueLike(state.tone);
-  const formatOk = hasValueLike(state.format);
+/* ---------------------------
+ * Rule Engine (Pass 1/2 -> Code)
+ * -------------------------- */
+function computeControlFlags({ risk_scan, format, intent, tone }) {
+  const isHighRisk = risk_scan.impact === "high" || risk_scan.continuity === "high";
+  const isEmail = format === "email";
+  const isOfficialIntent = intent === "make_it_official";
 
-  const contextOk =
-    isNonEmptyString(state.context) ||
-    (state.context &&
-      typeof state.context === "object" &&
-      (isNonEmptyString(state.context.text) ||
-        isNonEmptyString(state.context.value) ||
-        isNonEmptyString(state.context.summary) ||
-        isNonEmptyString(state.context.raw)));
+  const record_safe_required = isHighRisk || isEmail || isOfficialIntent;
 
-  const shapeMissing = [];
-  if (!relationshipOk) shapeMissing.push("relationship.value");
-  if (!targetOk) shapeMissing.push("target.value");
-  if (!intentOk) shapeMissing.push("intent.value");
-  if (!toneOk) shapeMissing.push("tone.value");
-  if (!formatOk) shapeMissing.push("format.value");
-  if (!contextOk) shapeMissing.push("context(text)");
+  const tone_floor = "calm";
+  const tone_ceiling = record_safe_required ? "firm" : tone;
 
-  return { ok: shapeMissing.length === 0, shapeMissing };
+  const max_chars =
+    format === "message"
+      ? record_safe_required
+        ? 520
+        : 700
+      : record_safe_required
+        ? 1100
+        : 1500;
+
+  return { record_safe_required, tone_floor, tone_ceiling, max_chars };
 }
 
-function ensureObjectHasKey(obj, key) {
-  return obj && typeof obj === "object" && key in obj;
-}
-
-function coerceJsonObjectOrFail(text) {
-  const obj = safeJsonParse(text);
-  if (!obj || typeof obj !== "object") return null;
-  return obj;
-}
-
-function pickModel(passName, formatId) {
-  const base = pickEnv("OPENAI_MODEL", "gpt-4.1-mini");
-  if (passName === "passA_normalize") return pickEnv("OPENAI_MODEL_NORMALIZE", base);
-  if (passName === "passB_layer1") return pickEnv("OPENAI_MODEL_LAYER1", base);
-  if (passName === "passC_assemble") {
-    const f = asLowerId(formatId);
-    if (f === "email") return pickEnv("OPENAI_MODEL_EMAIL", base);
-    return pickEnv("OPENAI_MODEL_MESSAGE", base);
-  }
-  return base;
-}
-
-function promptHeader(passName) {
-  return [
-    "CRITICAL OUTPUT CONTRACT:",
-    "- Return ONLY valid JSON.",
-    "- Do NOT include markdown.",
-    "- Do NOT include extra commentary.",
-    "- If you cannot comply, return: {\"error\":\"noncompliant_output\"}",
-    `- Pass: ${passName}`,
-  ].join("\n");
-}
-
-/** ----------------------------
- * Package-based output contract
- * ---------------------------- */
-function normalizePackageId(pkg) {
-  const p = asLowerId(pkg);
-  const allowed = new Set(["message", "email", "analysis_message", "analysis_email", "total"]);
-  return allowed.has(p) ? p : null;
-}
-
-function requestedOutputsForPackage(pkg) {
-  // 대표님 원칙 그대로:
-  // message -> message_text
-  // email -> email_text
-  // analysis_email -> analysis_report + email_text
-  // analysis_message -> analysis_report + message_text
-  // total -> analysis_report + message_text + email_text
+/* ---------------------------
+ * Package schema gating
+ * -------------------------- */
+function pkgSchemaFor(pkg) {
   switch (pkg) {
     case "message":
-      return { wantMessage: true, wantEmail: false, wantAnalysis: false };
+      return { required: ["message_text"], keys: ["message_text"] };
     case "email":
-      return { wantMessage: false, wantEmail: true, wantAnalysis: false };
-    case "analysis_message":
-      return { wantMessage: true, wantEmail: false, wantAnalysis: true };
+      return { required: ["email_text"], keys: ["email_text"] };
     case "analysis_email":
-      return { wantMessage: false, wantEmail: true, wantAnalysis: true };
+      return { required: ["email_text", "analysis_text"], keys: ["email_text", "analysis_text"] };
     case "total":
-      return { wantMessage: true, wantEmail: true, wantAnalysis: true };
+      return {
+        required: ["message_text", "email_text", "analysis_text"],
+        keys: ["message_text", "email_text", "analysis_text"],
+      };
     default:
-      return { wantMessage: false, wantEmail: false, wantAnalysis: false };
+      throw new Error(`Unknown package: ${pkg}`);
   }
 }
 
-function enforceFinalSchemaByPackage(finalObj, pkg) {
-  const p = normalizePackageId(pkg);
-  if (!p) return { ok: false, error: "invalid_package" };
-
-  const need = requestedOutputsForPackage(p);
-
-  // Keep only allowed keys (hard guarantee)
-  const keep = new Set(["package", "message_text", "email_text", "analysis_report", "notes", "safety_disclaimer"]);
-  for (const k of Object.keys(finalObj)) {
-    if (!keep.has(k)) delete finalObj[k];
-  }
-
-  // Force package to the requested one (don’t allow model to drift)
-  finalObj.package = p;
-
-  // Strip disallowed payloads
-  if (!need.wantMessage) delete finalObj.message_text;
-  if (!need.wantEmail) delete finalObj.email_text;
-  if (!need.wantAnalysis) delete finalObj.analysis_report;
-
-  // Validate required fields
-  if (!isNonEmptyString(finalObj.safety_disclaimer)) {
-    return { ok: false, error: "missing_safety_disclaimer" };
-  }
-  if (need.wantMessage && !isNonEmptyString(finalObj.message_text)) {
-    return { ok: false, error: "missing_message_text" };
-  }
-  if (need.wantEmail && !isNonEmptyString(finalObj.email_text)) {
-    return { ok: false, error: "missing_email_text" };
-  }
-  if (need.wantAnalysis && !isNonEmptyString(finalObj.analysis_report)) {
-    return { ok: false, error: "missing_analysis_report" };
-  }
-
-  return { ok: true };
+function jsonSchemaString(pkgSchema) {
+  return JSON.stringify(
+    {
+      type: "object",
+      additionalProperties: false,
+      required: pkgSchema.required,
+      properties: Object.fromEntries(pkgSchema.keys.map((k) => [k, { type: "string" }])),
+    },
+    null,
+    2
+  );
 }
 
-function pickPackageFromFrontState(state) {
-  // front sends: state.context.paywall.package (from your adapter)
-  const pkg =
-    state?.context?.paywall?.package ||
-    state?.context?.paywall?.package_id ||
-    state?.context?.package ||
-    state?.package;
-  return normalizePackageId(pkg) || "message"; // safe default
+/* ---------------------------
+ * Prompt blocks
+ * -------------------------- */
+function buildRiskOverrides(control) {
+  return control.record_safe_required
+    ? [
+        "Record-safe mode is REQUIRED:",
+        "- Use observable facts, not interpretations.",
+        "- No emotion labels, no blame, no speculation.",
+        "- One clear request + optional deadline.",
+      ].join("\n")
+    : "Record-safe mode is optional, but still avoid insults, blame, and speculation.";
 }
 
-export default async function handler(req, res) {
-  // CORS (minimal)
-  const allowOrigin = pickEnv("ALLOW_ORIGIN", "*");
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+function buildFormatRules(format) {
+  return format === "message"
+    ? ["Message format:", "- 2–6 short sentences.", "- No subject line.", "- Keep it human and direct."].join("\n")
+    : [
+        "Email format:",
+        "- Include a short Subject line inside email_text if appropriate.",
+        "- Use 2–5 short paragraphs or bullets for facts (if official).",
+        "- End with a clear next step.",
+      ].join("\n");
+}
 
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return jsonFail(res, 405, "method", { error: "Method not allowed" });
+function buildToneMicroStyle(control) {
+  switch (control.tone_ceiling) {
+    case "formal":
+      return "- Formal, precise wording. Minimal softeners.";
+    case "firm":
+      return "- Calm but firm. Clear requests. No emotional framing.";
+    case "neutral":
+      return "- Neutral and straightforward. No extra warmth.";
+    default:
+      return "- Calm, respectful, de-escalating. Minimal emotion words.";
+  }
+}
 
-  const fail = (status, stage, extra = {}) => jsonFail(res, status, stage, extra);
+function pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format }) {
+  // Highest priority: record-safe + make_it_official per relationship
+  if (control.record_safe_required && intent === "make_it_official") {
+    const f = GUIDELINE_MAP.fewshot_record_safe?.make_it_official?.[relationship];
+    if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
+  }
 
+  // Next: record-safe default per relationship
+  if (control.record_safe_required) {
+    const f = GUIDELINE_MAP.fewshot_record_safe?.[relationship]?.["__default__"];
+    if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
+  }
+
+  // Otherwise: normal few-shot per relationship
+  const f = GUIDELINE_MAP.fewshot?.[relationship]?.["__default__"];
+  if (f) return format === "email" ? { email_text: f.email_text } : { message_text: f.message_text };
+
+  // Last-resort generic floor
+  return format === "email"
+    ? { email_text: "Subject: Quick alignment\n\nHi —\n\nCould you confirm the next step by [deadline]?\n\nThanks,\n[Your Name]" }
+    : { message_text: "Hi — could you confirm the next step when you have a moment? Thanks." };
+}
+
+function buildSystemPrompt({
+  pkg,
+  format,
+  relationship,
+  intent,
+  tone,
+  risk_scan,
+  control,
+  intentGuide,
+  relationGuide,
+  schemaStr,
+  blocks,
+  fewshotExample,
+}) {
+  return `
+You are ClearBound vNext. Generate a relationship-safe message/email under strict constraints.
+
+<<<CONTROL_BLOCK>>>
+package: ${pkg}
+format: ${format}
+relationship: ${relationship}
+intent: ${intent}
+tone_requested: ${tone}
+risk_scan: impact=${risk_scan.impact}, continuity=${risk_scan.continuity}
+record_safe_required: ${control.record_safe_required}
+tone_floor: ${control.tone_floor} ; tone_ceiling: ${control.tone_ceiling}
+max_chars: ${control.max_chars}
+<<<END_CONTROL_BLOCK>>>
+
+OUTPUT CONTRACT:
+- Output MUST be valid JSON ONLY.
+- Output keys MUST match the allowed schema exactly.
+- Never include markdown. Never include any explanation.
+
+SAFETY RULES:
+- Do not invent facts. Do not diagnose motives. Do not give legal/medical advice.
+- No insults, no threats, no ultimatums unless explicitly required by record-safe rules.
+
+PRIORITY & CONFLICT RULES:
+- HARD RULES (output contract + safety + risk overrides) override everything.
+- Follow Intent for STRUCTURE (what to include + order).
+- Follow Relationship for WORDING (softening + phrasing style).
+- If record-safe is required, ignore any guideline that introduces emotion, blame, or speculation.
+
+RISK OVERRIDES:
+${blocks.risk_overrides}
+
+FORMAT RULES:
+${blocks.format_rules}
+
+INTENT GUIDELINE (STRUCTURE):
+BRIEF: ${intentGuide.brief}
+STRUCTURE:
+${intentGuide.structure.map((s) => `- ${s}`).join("\n")}
+MUST INCLUDE:
+${bulletLines(intentGuide.must_include)}
+AVOID:
+${bulletLines(intentGuide.avoid)}
+
+RELATIONSHIP GUIDELINE (WORDING):
+BRIEF: ${relationGuide.brief}
+DO:
+${bulletLines(relationGuide.do)}
+AVOID:
+${bulletLines(relationGuide.avoid)}
+
+TONE MICRO-STYLE:
+${blocks.tone_micro}
+
+FEW-SHOT (STYLE FLOOR):
+Expected JSON example style (do not copy placeholders):
+${JSON.stringify(fewshotExample, null, 2)}
+
+JSON SCHEMA (STRICT):
+${schemaStr}
+
+FINAL OUTPUT REQUIREMENT (HARD RULE):
+Return ONLY the JSON object. No preamble. No postscript. No markdown. No extra keys.
+All generated text MUST strictly follow the "STRUCTURE" defined in the Intent Guideline.
+If any guideline conflicts with this requirement, ignore the guideline and follow this requirement.
+`.trim();
+}
+
+function buildUserPrompt({ rawContext, max_chars }) {
+  return `<<<USER_CONTEXT>>>\n${rawContext}\n<<<END_USER_CONTEXT>>>\n(Keep the generated output within max_chars≈${max_chars} characters.)`;
+}
+
+/* ---------------------------
+ * Validation + repair + fallback
+ * -------------------------- */
+function validateJsonResult(obj, pkgSchema) {
+  if (!obj || typeof obj !== "object") throw new Error("Output is not an object");
+  for (const k of Object.keys(obj)) {
+    if (!pkgSchema.keys.includes(k)) throw new Error(`Extra key: ${k}`);
+    if (typeof obj[k] !== "string") throw new Error(`Non-string field: ${k}`);
+    if (!obj[k].trim()) throw new Error(`Empty field: ${k}`);
+  }
+  for (const req of pkgSchema.required) {
+    if (!(req in obj)) throw new Error(`Missing required: ${req}`);
+  }
+  return true;
+}
+
+async function callLLM({ model, temperature, system, user }) {
+  const r = await client.chat.completions.create({
+    model,
+    temperature,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  });
+  return r.choices?.[0]?.message?.content ?? "";
+}
+
+function buildRepairSystem({ schemaStr, allowedKeys }) {
+  return `
+You are a JSON repair tool.
+Return ONLY a valid JSON object that matches this schema exactly:
+${schemaStr}
+Allowed keys: ${allowedKeys.join(", ")}
+No extra keys. No markdown. No commentary.
+`.trim();
+}
+
+function safeFallback(pkg) {
+  if (pkg === "message") {
+    return { message_text: "Hi — I’d like to align on one point. Could you confirm the next step when you have a moment? Thank you." };
+  }
+  if (pkg === "email") {
+    return { email_text: "Subject: Quick alignment\n\nHi —\n\nI’d like to align on one point. Could you confirm the next step by [deadline]?\n\nThank you,\n[Your Name]" };
+  }
+  if (pkg === "analysis_email") {
+    return {
+      email_text: "Subject: Quick alignment\n\nHi —\n\nI’d like to align on one point. Could you confirm the next step by [deadline]?\n\nThank you,\n[Your Name]",
+      analysis_text: "Fallback used due to formatting constraints. Neutral record-safe language applied.",
+    };
+  }
+  return {
+    message_text: "Hi — could you confirm the next step when you have a moment? Thank you.",
+    email_text: "Subject: Quick alignment\n\nHi —\n\nCould you confirm the next step by [deadline]?\n\nThank you,\n[Your Name]",
+    analysis_text: "Fallback used due to formatting constraints. Neutral record-safe language applied.",
+  };
+}
+
+/* ---------------------------
+ * Model routing (LOCKed policy)
+ * -------------------------- */
+function pickModelAndTemp(control) {
+  const model = control.record_safe_required
+    ? (process.env.CB_MODEL_HIGH_RISK || "gpt-5")
+    : (process.env.CB_MODEL_DEFAULT || "gpt-4.1-mini");
+
+  const temperature = control.record_safe_required
+    ? Number(process.env.CB_TEMPERATURE_HIGH_RISK ?? 0.2)
+    : Number(process.env.CB_TEMPERATURE_DEFAULT ?? 0.4);
+
+  return { model, temperature };
+}
+
+/* ---------------------------
+ * Request parsing
+ * -------------------------- */
+function parseState(req) {
+  // WordPress proxy may send { state: "<json>" }.
+  // Direct calls may send JSON object directly.
+  if (req?.body?.state) {
+    return JSON.parse(req.body.state);
+  }
+  return req.body || {};
+}
+
+/* ---------------------------
+ * Handler
+ * -------------------------- */
+module.exports = async function handler(req, res) {
   try {
-    const body = req.body || {};
-    const state = body.state;
+    // Basic CORS (optional; safe if ALLOW_ORIGIN set)
+    const allowOrigin = process.env.ALLOW_ORIGIN || "*";
+    res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-    if (!state || typeof state !== "object") {
-      return fail(400, "validate_body", { error: "Missing or invalid `state` object" });
-    }
+    if (req.method === "OPTIONS") return res.status(204).end();
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
 
-    const { ok: keysOk, missing } = looksLikeFrontState(state);
-    if (!keysOk) {
-      return fail(400, "validate_state_keys", { error: `Missing fields: ${missing.join(", ")}` });
-    }
+    const GUIDELINE_MAP = await loadGuidelineMap();
+    const state = parseState(req);
 
-    const shape = validateFrontStateShape(state);
-    if (!shape.ok) {
-      return fail(400, "validate_state_shape", {
-        error: "Invalid or empty fields",
-        details: { missing: shape.shapeMissing },
-      });
-    }
+    // Support both legacy and vNext field names
+    const relationship =
+      state.relationship_axis?.value ??
+      state.relationship?.value;
 
-    // Package enforcement inputs
-    const pkg = pickPackageFromFrontState(state);
-    const requested = requestedOutputsForPackage(pkg);
+    const intent = state.intent?.value;
+    const tone = state.tone?.value;
+    const format = state.format?.value;
 
-    // Env
-    const OPENAI_API_KEY = pickEnv("OPENAI_API_KEY");
-    const PROMPTS_REPO = pickEnv("PROMPTS_REPO");
-    const PROMPTS_REF = pickEnv("PROMPTS_REF", "main");
+    const pkg =
+      state.context?.paywall?.package ??
+      state.paywall?.package ??
+      state.context?.package;
 
-    if (!OPENAI_API_KEY) return fail(500, "env", { error: "OPENAI_API_KEY missing" });
-    if (!PROMPTS_REPO) return fail(500, "env", { error: "PROMPTS_REPO missing" });
+    const risk_scan =
+      state.risk_scan ??
+      state.context?.risk_scan;
 
-    const ttlMs =
-      Number(pickEnv("PROMPT_CACHE_TTL_MS", String(DEFAULT_CACHE_TTL_MS))) || DEFAULT_CACHE_TTL_MS;
+    assertEnum("relationship", relationship, ENUMS.relationship);
+    assertEnum("intent", intent, ENUMS.intent);
+    assertEnum("tone", tone, ENUMS.tone);
+    assertEnum("format", format, ENUMS.format);
+    assertEnum("package", pkg, ENUMS.package);
+    assertEnum("risk_scan.impact", risk_scan?.impact, ENUMS.impact);
+    assertEnum("risk_scan.continuity", risk_scan?.continuity, ENUMS.continuity);
 
-    const includeQa = String(pickEnv("INCLUDE_QA_RULES", "1")) === "1";
-    const retryOnce = String(pickEnv("OPENAI_RETRY_ONCE", "1")) === "1";
+    const control = computeControlFlags({ risk_scan, format, intent, tone });
 
-    const ghRaw = (path) => `https://raw.githubusercontent.com/${PROMPTS_REPO}/${PROMPTS_REF}/${path}`;
+    const CONTEXT_MAX = Number(process.env.CB_CONTEXT_MAX_CHARS || 1400);
+    const rawContext = clampText(state.context?.text ?? "", CONTEXT_MAX);
 
-    // Fixed prompt paths
-    const normalizePath = "prompts/normalize/normalize_state_to_canonical.prompt.md";
-    const layer1Path = "prompts/layer1/layer1_control.prompt.md";
-    const assemblePath = "prompts/assemble/assemble_generate.prompt.md";
+    const intentGuide = GUIDELINE_MAP.intent?.[intent];
+    if (!intentGuide) throw new Error(`Missing intent guide: ${intent}`);
 
-    // Output prompts (load ONLY what we need)
-    const outputMessagePath = "prompts/output/message.prompt.md";
-    const outputEmailPath = "prompts/output/email.prompt.md";
-    const outputAnalysisPath = "prompts/output/analysis_report.prompt.md";
+    const relationGuide = control.record_safe_required
+      ? GUIDELINE_MAP.record_safe_variant?.[relationship]
+      : GUIDELINE_MAP.relationship?.[relationship];
 
-    const qaCorePath = "qa/rules/core.yaml";
+    if (!relationGuide) throw new Error(`Missing relationship guide: ${relationship}`);
 
-    // Fetch shared prompts early
-    let normalizePrompt, layer1Prompt, assemblePrompt;
-    let outMsgPrompt = "", outEmailPrompt = "", outAnalysisPrompt = "", qaRulesPrompt = "";
+    const pkgSchema = pkgSchemaFor(pkg);
+    const schemaStr = jsonSchemaString(pkgSchema);
 
-    try {
-      const fetches = [
-        ["normalize", normalizePath],
-        ["layer1", layer1Path],
-        ["assemble", assemblePath],
-      ];
-
-      if (requested.wantMessage) fetches.push(["out_msg", outputMessagePath]);
-      if (requested.wantEmail) fetches.push(["out_email", outputEmailPath]);
-      if (requested.wantAnalysis) fetches.push(["out_analysis", outputAnalysisPath]);
-
-      if (includeQa) fetches.push(["qa", qaCorePath]);
-
-      const results = await Promise.all(
-        fetches.map(async ([label, path]) => {
-          const url = ghRaw(path);
-          const key = cacheKey(PROMPTS_REPO, PROMPTS_REF, path);
-          const text = await fetchTextWithCache(url, key, ttlMs);
-          return [label, text];
-        })
-      );
-
-      const byLabel = Object.fromEntries(results);
-      normalizePrompt = byLabel.normalize;
-      layer1Prompt = byLabel.layer1;
-      assemblePrompt = byLabel.assemble;
-      outMsgPrompt = byLabel.out_msg || "";
-      outEmailPrompt = byLabel.out_email || "";
-      outAnalysisPrompt = byLabel.out_analysis || "";
-      qaRulesPrompt = byLabel.qa || "";
-    } catch (e) {
-      return fail(502, "prompt_fetch", { error: String(e?.message || e) });
-    }
-
-    // -----------------------
-    // PASS A: state -> canonical
-    // -----------------------
-    const passA_system = [promptHeader("passA_normalize"), "", normalizePrompt].join("\n");
-    const passA_user = JSON.stringify({ state }, null, 2);
-
-    const passA_payload = {
-      model: pickModel("passA_normalize", state.format?.value),
-      input: [
-        { role: "system", content: passA_system },
-        { role: "user", content: passA_user },
-      ],
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE_NORMALIZE", "0.0")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_NORMALIZE", "700")),
+    const blocks = {
+      risk_overrides: buildRiskOverrides(control),
+      format_rules: buildFormatRules(format),
+      tone_micro: buildToneMicroStyle(control),
     };
 
-    const a = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passA_payload, retryOnce });
-    if (!a.ok) {
-      return fail(502, "passA_openai", {
-        error: "OpenAI failed (Pass A)",
-        http_status: a.status,
-        details: a.data || { raw: (a.raw || "").slice(0, 600) },
-      });
-    }
+    const fewshotExample = pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format });
 
-    const passA_text = extractOutputText(a.data);
-    const passA_obj = coerceJsonObjectOrFail(passA_text);
-
-    if (!passA_obj || !ensureObjectHasKey(passA_obj, "canonical")) {
-      return fail(502, "passA_missing_canonical", {
-        error: "Pass A missing `canonical` object",
-        details: { snippet: (passA_text || "").slice(0, 400), keys: passA_obj ? Object.keys(passA_obj) : null },
-      });
-    }
-
-    const canonical = passA_obj.canonical;
-    if (!canonical || typeof canonical !== "object") {
-      return fail(502, "passA_bad_canonical", { error: "Invalid canonical payload" });
-    }
-
-    // -----------------------
-    // PASS B: canonical -> layer1
-    // -----------------------
-    const passB_system = [promptHeader("passB_layer1"), "", layer1Prompt].join("\n");
-    const passB_user = JSON.stringify({ canonical }, null, 2);
-
-    const passB_payload = {
-      model: pickModel("passB_layer1", state.format?.value),
-      input: [
-        { role: "system", content: passB_system },
-        { role: "user", content: passB_user },
-      ],
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE_LAYER1", "0.0")),
-      max_output_tokens: Number(pickEnv("OPENAI_MAX_OUTPUT_TOKENS_LAYER1", "900")),
-    };
-
-    const b = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passB_payload, retryOnce });
-    if (!b.ok) {
-      return fail(502, "passB_openai", {
-        error: "OpenAI failed (Pass B)",
-        http_status: b.status,
-        details: b.data || { raw: (b.raw || "").slice(0, 600) },
-      });
-    }
-
-    const passB_text = extractOutputText(b.data);
-    const passB_obj = coerceJsonObjectOrFail(passB_text);
-
-    if (!passB_obj || !ensureObjectHasKey(passB_obj, "layer1")) {
-      return fail(502, "passB_missing_layer1", {
-        error: "Pass B missing `layer1` object",
-        details: { snippet: (passB_text || "").slice(0, 400), keys: passB_obj ? Object.keys(passB_obj) : null },
-      });
-    }
-
-    const layer1 = passB_obj.layer1;
-    if (!layer1 || typeof layer1 !== "object") {
-      return fail(502, "passB_bad_layer1", { error: "Invalid layer1 payload" });
-    }
-
-    // -----------------------
-    // PASS C: {canonical, layer1, requested_outputs} -> final deliverables JSON
-    // -----------------------
-    const intentId = asLowerId(canonical.intent);
-    const intentPath = resolveIntentPath(intentId);
-
-    if (!intentPath) {
-      return fail(400, "validate_ids", {
-        error: "Invalid intent value (canonical.intent)",
-        details: { intentId },
-      });
-    }
-
-    // Fetch intent prompt
-    let intentPrompt;
-    try {
-      const url = ghRaw(intentPath);
-      const key = cacheKey(PROMPTS_REPO, PROMPTS_REF, intentPath);
-      intentPrompt = await fetchTextWithCache(url, key, ttlMs);
-    } catch (e) {
-      return fail(502, "prompt_fetch_intent", { error: String(e?.message || e) });
-    }
-
-    // Build Pass C system with ONLY required output prompts
-    const systemParts = [
-      promptHeader("passC_assemble"),
-      "",
-      "Return ONLY the final JSON deliverables. No explanations.",
-      "",
-      `REQUESTED PACKAGE: ${pkg}`,
-      `REQUESTED OUTPUTS: ${JSON.stringify(requested)}`,
-      "",
-      "Hard rules:",
-      "- If requested.wantAnalysis is false: DO NOT include analysis_report.",
-      "- If requested.wantMessage is false: DO NOT include message_text.",
-      "- If requested.wantEmail is false: DO NOT include email_text.",
-      "- Always include: package, safety_disclaimer.",
-      "- package MUST equal REQUESTED PACKAGE.",
-      "",
-      intentPrompt,
-    ];
-
-    if (requested.wantMessage) systemParts.push("", "=== OUTPUT RULES: MESSAGE ===", outMsgPrompt);
-    if (requested.wantEmail) systemParts.push("", "=== OUTPUT RULES: EMAIL ===", outEmailPrompt);
-    if (requested.wantAnalysis) systemParts.push("", "=== OUTPUT RULES: ANALYSIS REPORT ===", outAnalysisPrompt);
-
-    systemParts.push("", assemblePrompt);
-
-    if (includeQa && qaRulesPrompt) {
-      systemParts.push("", "=== QA RULES (internal compliance) ===", qaRulesPrompt);
-    }
-
-    const passC_system = systemParts.join("\n");
-
-    // Feed requested outputs into user content so it’s “visible” in both system+user
-    const passC_user = JSON.stringify(
-      { canonical, layer1, requested, package: pkg },
-      null,
-      2
-    );
-
-    const formatId = asLowerId(state.format?.value);
-    const passC_payload = {
-      model: pickModel("passC_assemble", formatId),
-      input: [
-        { role: "system", content: passC_system },
-        { role: "user", content: passC_user },
-      ],
-      // keep creativity moderate, but not too high
-      temperature: Number(pickEnv("OPENAI_TEMPERATURE", "0.3")),
-      // reduce output tokens when fewer outputs requested
-      max_output_tokens: Number(
-        pickEnv(
-          "OPENAI_MAX_OUTPUT_TOKENS",
-          requested.wantAnalysis ? "900" : "450"
-        )
-      ),
-    };
-
-    const c = await callOpenAIWithOptionalRetry({ apiKey: OPENAI_API_KEY, payload: passC_payload, retryOnce });
-    if (!c.ok) {
-      return fail(502, "passC_openai", {
-        error: "OpenAI failed (Pass C)",
-        http_status: c.status,
-        details: c.data || { raw: (c.raw || "").slice(0, 600) },
-      });
-    }
-
-    const passC_text = extractOutputText(c.data);
-    if (!passC_text) {
-      return fail(502, "passC_empty_output", {
-        error: "Empty result (Pass C)",
-        details: { id: c.data?.id, status: c.data?.status },
-      });
-    }
-
-    const finalObj = safeJsonParse(passC_text);
-    if (!finalObj || typeof finalObj !== "object") {
-      return fail(502, "passC_non_json", {
-        error: "Final output is not valid JSON",
-        details: { snippet: passC_text.slice(0, 600) },
-      });
-    }
-
-    // Must contain minimum required fields
-    if (!("package" in finalObj) || !("safety_disclaimer" in finalObj)) {
-      return fail(502, "passC_bad_schema", {
-        error: "Final JSON missing required fields",
-        details: { keys: Object.keys(finalObj).slice(0, 50) },
-      });
-    }
-
-    // HARD ENFORCEMENT by package (strip + validate)
-    const enforced = enforceFinalSchemaByPackage(finalObj, pkg);
-    if (!enforced.ok) {
-      return fail(502, "passC_package_contract_failed", {
-        error: "Final JSON violates package output contract",
-        details: { package: pkg, reason: enforced.error, keys: Object.keys(finalObj) },
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      result_text: JSON.stringify(finalObj), // IMPORTANT: stringify normalized/stripped object
-      meta: {
-        pipeline: "3-pass",
-        package: pkg,
-        requested,
-        model: passC_payload.model,
-        prompts_repo: PROMPTS_REPO,
-        prompts_ref: PROMPTS_REF,
-        intent: intentId,
-        include_qa: includeQa,
-        passA_model: passA_payload.model,
-        passB_model: passB_payload.model,
-      },
+    const system = buildSystemPrompt({
+      pkg,
+      format,
+      relationship,
+      intent,
+      tone,
+      risk_scan,
+      control,
+      intentGuide,
+      relationGuide,
+      schemaStr,
+      blocks,
+      fewshotExample,
     });
-  } catch (e) {
+
+    const user = buildUserPrompt({ rawContext, max_chars: control.max_chars });
+
+    const { model, temperature } = pickModelAndTemp(control);
+
+    // Primary single call
+    let text = await callLLM({ model, temperature, system, user });
+
+    // Parse + validate
+    let obj;
+    try {
+      obj = JSON.parse(text);
+      validateJsonResult(obj, pkgSchema);
+    } catch {
+      // Optional repair (rare; keeps UX stable)
+      const repairSystem = buildRepairSystem({ schemaStr, allowedKeys: pkgSchema.keys });
+      const repairUser = `Fix this into valid JSON only:\n\n${text}`;
+
+      const repaired = await callLLM({
+        model,
+        temperature: 0.0,
+        system: repairSystem,
+        user: repairUser,
+      });
+
+      try {
+        obj = JSON.parse(repaired);
+        validateJsonResult(obj, pkgSchema);
+      } catch {
+        obj = safeFallback(pkg);
+      }
+    }
+
+    return res.status(200).json({ ok: true, ...obj });
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      stage: "server_error",
-      error: "Server error",
-      details: String(e?.message || e),
+      error: "GENERATION_FAILED",
+      message: err?.message || String(err),
     });
   }
-}
+};
