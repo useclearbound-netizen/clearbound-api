@@ -1,12 +1,12 @@
 // clearbound-api/api/generate.js
-// vNext single-call pipeline:
+// vNext single-call pipeline (Ops-Optimized):
 // - Remote GUIDELINE_MAP fetch (+ TTL cache)
 // - Code-based control flags (record-safe, tone ceiling, max chars)
-// - Model routing: DEFAULT vs HIGH_RISK
+// - Model routing: DEFAULT vs HIGH_RISK (cost-optimized)
 // - Strict JSON output gating (+ optional repair call if JSON parse fails)
 //
-// NOTE (2026-02): Some models reject non-default temperature overrides.
-// To keep runtime stable, we DO NOT send temperature at all.
+// NOTE: Some models reject non-default temperature overrides.
+// For stability, we DO NOT send temperature at all.
 
 const OpenAI = require("openai");
 
@@ -87,8 +87,14 @@ function computeControlFlags({ risk_scan, format, intent, tone }) {
   const isEmail = format === "email";
   const isOfficialIntent = intent === "make_it_official";
 
-  // NOTE: 현재 정책상 email은 record-safe로 취급
+  // record_safe_required = "writing safety mode" (wording + constraints)
+  // - Email can still be record-safe without forcing a high-cost model.
   const record_safe_required = isHighRisk || isEmail || isOfficialIntent;
+
+  // high_risk_model_required = "model escalation switch" (cost control)
+  // - Only escalate model when truly necessary.
+  // - Keep make_it_official escalated by default (recommended for accuracy/record safety).
+  const high_risk_model_required = isHighRisk || isOfficialIntent;
 
   const tone_floor = "calm";
   const tone_ceiling = record_safe_required ? "firm" : tone;
@@ -102,7 +108,7 @@ function computeControlFlags({ risk_scan, format, intent, tone }) {
         ? 1100
         : 1500;
 
-  return { record_safe_required, tone_floor, tone_ceiling, max_chars };
+  return { record_safe_required, high_risk_model_required, tone_floor, tone_ceiling, max_chars };
 }
 
 /* ---------------------------
@@ -300,7 +306,6 @@ function validateJsonResult(obj, pkgSchema) {
 }
 
 async function callLLM({ model, system, user }) {
-  // NOTE: Do NOT send temperature to avoid model-specific parameter rejection.
   const r = await client.chat.completions.create({
     model,
     messages: [
@@ -342,10 +347,10 @@ function safeFallback(pkg) {
 }
 
 /* ---------------------------
- * Model routing (LOCKed policy)
+ * Model routing (Ops-Optimized)
  * -------------------------- */
 function pickModel(control) {
-  return control.record_safe_required
+  return control.high_risk_model_required
     ? (process.env.CB_MODEL_HIGH_RISK || "gpt-5")
     : (process.env.CB_MODEL_DEFAULT || "gpt-4.1-mini");
 }
@@ -438,10 +443,11 @@ module.exports = async function handler(req, res) {
 
     const model = pickModel(control);
 
-    // ✅ DEBUG (model routing snapshot)
+    // DEBUG: routing snapshot (helps verify cost policy in runtime logs)
     console.log("cb_model_selected", {
       model,
       record_safe_required: control.record_safe_required,
+      high_risk_model_required: control.high_risk_model_required,
       pkg,
       format,
       relationship,
