@@ -1,12 +1,13 @@
 // clearbound-api/api/generate.js
-// vNext Ops-Optimized (Final):
+// vNext Ops-Optimized (Final + Normalization):
 // - Remote GUIDELINE_MAP fetch (+ TTL cache)
+// - Defensive normalization of incoming state (front/back contract drift safe)
 // - Code-based control flags (record-safe, tone ceiling, max chars)
 // - Model split:
 //   * message/email (with note): gpt-4.1-mini (fast)
-//   * analysis (only when needed): gpt-4.1
+//   * analysis (only when needed): gpt-4.1 (heavier)
 // - Strict JSON output gating (+ optional repair call)
-// - MIN length enforcement via postprocess (no extra LLM call)
+// - MIN/MAX length enforcement via postprocess (no extra LLM call)
 // - analysis_text forced to exactly 3 lines (prompt + postprocess)
 // NOTE: Do NOT send temperature (some models reject non-default overrides).
 
@@ -60,6 +61,7 @@ const ENUMS = {
   ],
   tone: ["calm", "neutral", "firm", "formal"],
   format: ["message", "email"],
+  // packages (backend)
   package: ["message", "email", "analysis_email", "total"],
   impact: ["low", "high"],
   continuity: ["low", "mid", "high"],
@@ -90,53 +92,160 @@ function safeJoin(...parts) {
 }
 
 /* ---------------------------
- * Relationship normalization (legacy -> axis)
- * -------------------------- */
-function normalizeRelationship(raw) {
-  if (!raw) return raw;
-
-  if (ENUMS.relationship.includes(raw)) return raw;
-
-  const legacyMap = {
-    family: "intimate",
-    partner: "intimate",
-    spouse: "intimate",
-
-    friend: "personal",
-    friends: "personal",
-
-    coworker: "social",
-    workplace: "social",
-    organization: "social",
-    org: "social",
-
-    service_provider: "peripheral",
-    provider: "peripheral",
-    business: "peripheral",
-    vendor: "peripheral",
-    landlord: "peripheral",
-    neighbor: "peripheral",
-  };
-
-  return legacyMap[raw] || raw;
-}
-
-/* ---------------------------
  * MIN/MAX Policy (Ops Locked)
  * -------------------------- */
 const POLICY = {
+  // MIN chars
   MIN_MESSAGE_CHARS: Number(process.env.CB_MIN_MESSAGE_CHARS || 380),
   MIN_EMAIL_CHARS: Number(process.env.CB_MIN_EMAIL_CHARS || 700),
   MIN_NOTE_CHARS: Number(process.env.CB_MIN_NOTE_CHARS || 240),
 
+  // Analysis lines
   ANALYSIS_LINES: 3,
   ANALYSIS_TOTAL_MIN_CHARS: Number(process.env.CB_MIN_ANALYSIS_CHARS || 330),
 
+  // MAX chars (sane caps)
   MAX_MESSAGE_CHARS: Number(process.env.CB_MAX_MESSAGE_CHARS || 700),
   MAX_EMAIL_CHARS: Number(process.env.CB_MAX_EMAIL_CHARS || 1100),
   MAX_NOTE_CHARS: Number(process.env.CB_MAX_NOTE_CHARS || 420),
   MAX_ANALYSIS_CHARS: Number(process.env.CB_MAX_ANALYSIS_CHARS || 520),
 };
+
+/* ---------------------------
+ * Request parsing
+ * -------------------------- */
+function parseState(req) {
+  // WordPress proxy may send { state: "<json>" }.
+  // Direct calls may send JSON object directly.
+  if (req?.body?.state) return JSON.parse(req.body.state);
+  return req.body || {};
+}
+
+/* ---------------------------
+ * Defensive normalization
+ * -------------------------- */
+const INTENT_ALIASES = {
+  // common front aliases -> backend enum
+  clarify_correct: "clarify_or_correct",
+  clarify_or_correct: "clarify_or_correct",
+  correct: "clarify_or_correct",
+
+  official: "make_it_official",
+  official_documented: "make_it_official",
+  make_it_official: "make_it_official",
+
+  close_loop: "close_the_loop",
+  close_the_loop: "close_the_loop",
+
+  boundary: "set_boundary",
+  set_boundary: "set_boundary",
+
+  pushback: "push_back",
+  push_back: "push_back",
+
+  reset: "reset_expectations",
+  reset_expectations: "reset_expectations",
+
+  address: "address_issue",
+  address_issue: "address_issue",
+};
+
+const REL_AXIS_ALIASES = {
+  // if someone sends family/friends/etc by mistake, map to axis buckets
+  family: "intimate",
+  friends_personal: "personal",
+  living_proximity: "social",
+  work_professional: "social",
+  orgs_services: "peripheral",
+};
+
+function normalizeEnum(value, aliasesMap) {
+  const v = (value ?? "").toString().trim();
+  if (!v) return v;
+  return aliasesMap?.[v] || v;
+}
+
+function normalizePkg(pkgRaw) {
+  const p = (pkgRaw ?? "").toString().trim();
+  if (!p) return p;
+
+  // If UI still sends analysis_message, convert to analysis_email? (or reject)
+  // We DO NOT support analysis_message in backend contract.
+  if (p === "analysis_message") return "analysis_email";
+
+  return p;
+}
+
+function deriveFormatFromPkgAndState({ pkg, stateFormat, paywallOutput }) {
+  const f = (stateFormat ?? "").toString().trim();
+  if (f === "message" || f === "email") return f;
+
+  // If paywall output says message/email/both
+  const o = (paywallOutput ?? "").toString().trim();
+  if (o === "message") return "message";
+  if (o === "email") return "email";
+  if (o === "both") return "email"; // default
+
+  // fallback by package
+  if (pkg === "message") return "message";
+  return "email";
+}
+
+function buildContextTextFromState(state) {
+  // backend requires context.text (non-empty recommended)
+  // Prefer context.text; fallback to context.key_facts; fallback to empty
+  const c = state?.context || {};
+  const t = (c.text ?? "").toString().trim();
+  if (t) return t;
+
+  const keyFacts = (c.key_facts ?? "").toString().trim();
+  const st = (c.situation_type ?? "").toString().trim();
+  const prefix = st ? `[${st}] ` : "";
+  const merged = `${prefix}${keyFacts}`.trim();
+  return merged;
+}
+
+function normalizeIncomingState(state) {
+  // Accept both:
+  // - v1 simple contract: relationship_axis/risk_scan...
+  // - vNext front adapter: relationship/tone/format/intent objects + context{}
+  const relationshipRaw =
+    state?.relationship_axis?.value ??
+    state?.relationship?.value ??
+    state?.relationship; // last-resort
+
+  // If frontend mistakenly sends family/friends_personal etc, map back to axis enum
+  const relationship = normalizeEnum(relationshipRaw, REL_AXIS_ALIASES);
+
+  const intentRaw = state?.intent?.value ?? state?.intent;
+  const intent = normalizeEnum(intentRaw, INTENT_ALIASES);
+
+  const toneRaw = state?.tone?.value ?? state?.tone;
+  const tone = (toneRaw ?? "").toString().trim();
+
+  const pkgRaw =
+    state?.context?.paywall?.package ??
+    state?.paywall?.package ??
+    state?.context?.package ??
+    state?.package;
+
+  const pkg = normalizePkg(pkgRaw);
+
+  const risk_scan = state?.risk_scan ?? state?.context?.risk_scan ?? {
+    impact: undefined,
+    continuity: undefined,
+  };
+
+  const format = deriveFormatFromPkgAndState({
+    pkg,
+    stateFormat: state?.format?.value ?? state?.format,
+    paywallOutput: state?.context?.paywall?.output ?? state?.paywall?.output,
+  });
+
+  const rawContext = buildContextTextFromState(state);
+
+  return { relationship, intent, tone, format, pkg, risk_scan, rawContext };
+}
 
 /* ---------------------------
  * Rule Engine (Pass 1/2 -> Code)
@@ -146,20 +255,20 @@ function computeControlFlags({ risk_scan, format, intent, tone }) {
   const isEmail = format === "email";
   const isOfficialIntent = intent === "make_it_official";
 
+  // wording safety mode
   const record_safe_required = isHighRisk || isEmail || isOfficialIntent;
-  const analysis_required = isHighRisk || isOfficialIntent; // keep tight for cost
+
+  // analysis call (tight for cost)
+  const analysis_required = isHighRisk || isOfficialIntent;
 
   const tone_floor = "calm";
   const tone_ceiling = record_safe_required ? "firm" : tone;
 
+  // hint-only (not hard enforcement; postprocess enforces)
   const main_max_chars =
     format === "message"
-      ? record_safe_required
-        ? 520
-        : 700
-      : record_safe_required
-        ? 1100
-        : 1500;
+      ? record_safe_required ? 520 : 700
+      : record_safe_required ? 1100 : 1500;
 
   return { record_safe_required, analysis_required, tone_floor, tone_ceiling, main_max_chars };
 }
@@ -177,10 +286,7 @@ function pkgSchemaFor(pkg) {
     case "analysis_email":
       return { required: ["email_text", "analysis_text"], keys: ["email_text", "analysis_text"] };
     case "total":
-      return {
-        required: ["message_text", "email_text", "analysis_text"],
-        keys: ["message_text", "email_text", "analysis_text"],
-      };
+      return { required: ["message_text", "email_text", "analysis_text"], keys: ["message_text", "email_text", "analysis_text"] };
     default:
       throw new Error(`Unknown package: ${pkg}`);
   }
@@ -238,6 +344,7 @@ function buildToneMicroStyle(control) {
 }
 
 function buildNoteRules(pkg) {
+  // Note is ONLY for user (not the recipient).
   if (pkg === "message" || pkg === "email") {
     return [
       "NOTE RULES (for note_text):",
@@ -265,16 +372,18 @@ function buildAnalysisRules() {
  * Few-shot selection
  * -------------------------- */
 function pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format, pkg }) {
+  // Priority: record-safe + make_it_official per relationship
   if (control.record_safe_required && intent === "make_it_official") {
     const f = GUIDELINE_MAP.fewshot_record_safe?.make_it_official?.[relationship];
     if (f) {
       if (pkg === "email") return { email_text: f.email_text, note_text: "Short note: record-safe, factual, clear request." };
       if (pkg === "message") return { message_text: f.message_text, note_text: "Short note: calm, respectful, specific request." };
-      if (pkg === "analysis_email") return { email_text: f.email_text, analysis_text: "Record-safe. Facts only.\nClear request.\nNo blame." };
-      if (pkg === "total") return { message_text: f.message_text, email_text: f.email_text, analysis_text: "Record-safe. Facts only.\nClear request.\nNo blame." };
+      if (pkg === "analysis_email") return { email_text: f.email_text, analysis_text: "Record-safe.\nFacts only.\nClear request." };
+      if (pkg === "total") return { message_text: f.message_text, email_text: f.email_text, analysis_text: "Record-safe.\nFacts only.\nClear request." };
     }
   }
 
+  // record-safe default per relationship
   if (control.record_safe_required) {
     const f = GUIDELINE_MAP.fewshot_record_safe?.[relationship]?.["__default__"];
     if (f) {
@@ -283,37 +392,39 @@ function pickFewshot({ GUIDELINE_MAP, relationship, intent, control, format, pkg
     }
   }
 
+  // normal default per relationship
   const f = GUIDELINE_MAP.fewshot?.[relationship]?.["__default__"];
   if (f) {
     if (pkg === "email") return { email_text: f.email_text, note_text: "Short note: friendly clarity, direct next step." };
     if (pkg === "message") return { message_text: f.message_text, note_text: "Short note: polite, clear ask, minimal friction." };
   }
 
+  // last-resort generic
   if (pkg === "email") {
     return {
       email_text:
-        "Subject: Quick clarification\n\nHi —\n\nCould you confirm the correct time/details so I can plan accordingly?\n\nThanks,\n[Your Name]",
-      note_text: "Short note: Keeps it neutral, asks one clear confirmation, avoids assumptions.",
+        "Subject: Quick clarification\n\nHi —\n\nCould you confirm the correct details so I can plan accordingly?\n\nThanks,\n[Your Name]",
+      note_text: "Short note: Neutral tone, one clear confirmation request, avoids assumptions.",
     };
   }
   if (pkg === "message") {
     return {
       message_text: "Hi — quick check: could you confirm the correct details when you have a moment? Thanks.",
-      note_text: "Short note: Simple, respectful, and low-pressure request for clarity.",
+      note_text: "Short note: Simple, respectful, low-pressure request for clarity.",
     };
   }
   if (pkg === "analysis_email") {
     return {
       email_text:
         "Subject: Record: Confirmation requested\n\nHello,\n\nFor record and clarity: please confirm the status and next steps by [deadline].\n\nRegards,\n[Your Name]",
-      analysis_text: "Record-safe posture.\nFacts only; no speculation.\nClear request + deadline.",
+      analysis_text: "Record-safe posture.\nFacts only.\nClear request + deadline.",
     };
   }
   return {
     message_text: "Hi — could you confirm the next step when you have a moment? Thank you.",
     email_text:
       "Subject: Quick alignment\n\nHi —\n\nCould you confirm the next step by [deadline]?\n\nThank you,\n[Your Name]",
-    analysis_text: "Record-safe posture.\nFacts only; no speculation.\nClear request + deadline.",
+    analysis_text: "Record-safe posture.\nFacts only.\nClear request + deadline.",
   };
 }
 
@@ -540,15 +651,12 @@ function safeFallback(pkg) {
 
 /* ---------------------------
  * Postprocess: enforce MIN/MAX without extra LLM call
- * (MIN first, then MAX cap last)
  * -------------------------- */
 function ensureMinChars(text, minChars, addon) {
   let t = normalizeNewlines(text);
   if (t.length >= minChars) return t;
-
   const pad = normalizeNewlines(addon);
   t = t ? `${t}\n\n${pad}` : pad;
-
   if (t.length < minChars) {
     t = `${t}\n\nIf there’s a better way to handle this, I’m open to it.`;
   }
@@ -562,6 +670,7 @@ function enforceMaxChars(text, maxChars) {
 
 function enforceAnalysis3Lines(analysisText) {
   let t = normalizeNewlines(analysisText);
+
   const lines = t.split("\n").map((x) => x.trim()).filter(Boolean);
 
   const out = [];
@@ -576,7 +685,7 @@ function enforceAnalysis3Lines(analysisText) {
   t = out.join("\n");
 
   if (t.length < POLICY.ANALYSIS_TOTAL_MIN_CHARS) {
-    const fixed = t.split("\n").filter(Boolean).slice(0, 3).map((line, idx) => {
+    const fixed = t.split("\n").slice(0, 3).map((line, idx) => {
       if (idx === 0) return `${line} This framing focuses on what can be verified rather than intent or emotion.`;
       if (idx === 1) return `${line} It helps prevent misinterpretation and supports follow-up if needed.`;
       return `${line} The request is specific and bounded, which reduces escalation risk.`;
@@ -590,57 +699,50 @@ function enforceAnalysis3Lines(analysisText) {
 
 function postprocessByPackage(pkg, obj) {
   if (pkg === "message") {
-    obj.message_text = enforceMaxChars(
-      ensureMinChars(obj.message_text, POLICY.MIN_MESSAGE_CHARS,
-        "I’m bringing this up so we can stay aligned and avoid confusion going forward."
-      ),
-      POLICY.MAX_MESSAGE_CHARS
+    obj.message_text = ensureMinChars(
+      enforceMaxChars(obj.message_text, POLICY.MAX_MESSAGE_CHARS),
+      POLICY.MIN_MESSAGE_CHARS,
+      "I’m bringing this up so we can stay aligned and avoid confusion going forward."
     );
-    obj.note_text = enforceMaxChars(
-      ensureMinChars(obj.note_text, POLICY.MIN_NOTE_CHARS,
-        "This keeps the tone calm and focuses on a clear request without blame. It’s designed to be easy to send and hard to misread."
-      ),
-      POLICY.MAX_NOTE_CHARS
+    obj.note_text = ensureMinChars(
+      enforceMaxChars(obj.note_text, POLICY.MAX_NOTE_CHARS),
+      POLICY.MIN_NOTE_CHARS,
+      "This keeps the tone calm and focuses on a clear request without blame. It’s designed to be easy to send and hard to misread."
     );
   }
 
   if (pkg === "email") {
-    obj.email_text = enforceMaxChars(
-      ensureMinChars(obj.email_text, POLICY.MIN_EMAIL_CHARS,
-        "If you can confirm the details and timing, I can proceed correctly. Thank you for helping clarify."
-      ),
-      POLICY.MAX_EMAIL_CHARS
+    obj.email_text = ensureMinChars(
+      enforceMaxChars(obj.email_text, POLICY.MAX_EMAIL_CHARS),
+      POLICY.MIN_EMAIL_CHARS,
+      "If you can confirm the details and timing, I can proceed correctly. Thank you for helping clarify."
     );
-    obj.note_text = enforceMaxChars(
-      ensureMinChars(obj.note_text, POLICY.MIN_NOTE_CHARS,
-        "This is written to be neutral and record-safe: it avoids assumptions and asks for one clear confirmation. It should reduce back-and-forth."
-      ),
-      POLICY.MAX_NOTE_CHARS
+    obj.note_text = ensureMinChars(
+      enforceMaxChars(obj.note_text, POLICY.MAX_NOTE_CHARS),
+      POLICY.MIN_NOTE_CHARS,
+      "This is written to be neutral and record-safe: it avoids assumptions and asks for one clear confirmation. It should reduce back-and-forth."
     );
   }
 
   if (pkg === "analysis_email") {
-    obj.email_text = enforceMaxChars(
-      ensureMinChars(obj.email_text, 800,
-        "Please confirm the processing date, reference number (if any), and the next steps. Thank you."
-      ),
-      POLICY.MAX_EMAIL_CHARS
+    obj.email_text = ensureMinChars(
+      enforceMaxChars(obj.email_text, POLICY.MAX_EMAIL_CHARS),
+      800, // high-risk email minimum
+      "Please confirm the processing date, reference number (if any), and the next steps. Thank you."
     );
     obj.analysis_text = enforceAnalysis3Lines(obj.analysis_text);
   }
 
   if (pkg === "total") {
-    obj.message_text = enforceMaxChars(
-      ensureMinChars(obj.message_text, 420,
-        "I’m sharing this clearly and respectfully so we can resolve it without misunderstandings."
-      ),
-      POLICY.MAX_MESSAGE_CHARS
+    obj.message_text = ensureMinChars(
+      enforceMaxChars(obj.message_text, POLICY.MAX_MESSAGE_CHARS),
+      420,
+      "I’m sharing this clearly and respectfully so we can resolve it without misunderstandings."
     );
-    obj.email_text = enforceMaxChars(
-      ensureMinChars(obj.email_text, 800,
-        "Please confirm the next steps and timing so we can close this out. Thank you."
-      ),
-      POLICY.MAX_EMAIL_CHARS
+    obj.email_text = ensureMinChars(
+      enforceMaxChars(obj.email_text, POLICY.MAX_EMAIL_CHARS),
+      800,
+      "Please confirm the next steps and timing so we can close this out. Thank you."
     );
     obj.analysis_text = enforceAnalysis3Lines(obj.analysis_text);
   }
@@ -676,37 +778,6 @@ function pickMaxTokensFor(pkg, phase) {
 }
 
 /* ---------------------------
- * Request parsing (robust)
- * -------------------------- */
-function parseState(req) {
-  const b = req?.body;
-
-  if (b && Object.prototype.hasOwnProperty.call(b, "state")) {
-    const s = b.state;
-
-    if (s && typeof s === "object") return s;
-
-    if (typeof s === "string") {
-      const trimmed = s.trim();
-      if (!trimmed) return {};
-      return JSON.parse(trimmed);
-    }
-
-    throw new Error(`Invalid state payload type: ${typeof s}`);
-  }
-
-  if (b && typeof b === "object") return b;
-
-  if (typeof b === "string") {
-    const trimmed = b.trim();
-    if (!trimmed) return {};
-    return JSON.parse(trimmed);
-  }
-
-  return {};
-}
-
-/* ---------------------------
  * Handler
  * -------------------------- */
 module.exports = async function handler(req, res) {
@@ -730,22 +801,18 @@ module.exports = async function handler(req, res) {
 
     const state = parseState(req);
 
-    /* ---------- State extraction ---------- */
-    const relationshipRaw = state.relationship_axis?.value ?? state.relationship?.value;
-    const relationship = normalizeRelationship(relationshipRaw);
+    /* ---------- Normalize incoming state ---------- */
+    const norm = normalizeIncomingState(state);
+    const relationship = norm.relationship;
+    const intent = norm.intent;
+    const tone = norm.tone;
+    const format = norm.format;
+    const pkg = norm.pkg;
+    const risk_scan = norm.risk_scan || {};
+    const CONTEXT_MAX = Number(process.env.CB_CONTEXT_MAX_CHARS || 1400);
+    const rawContext = clampText(norm.rawContext ?? "", CONTEXT_MAX);
 
-    const intent = state.intent?.value;
-    const tone = state.tone?.value;
-    const format = state.format?.value;
-
-    const pkg =
-      state.context?.paywall?.package ??
-      state.paywall?.package ??
-      state.context?.package;
-
-    const risk_scan = state.risk_scan ?? state.context?.risk_scan;
-
-    /* ---------- Validation ---------- */
+    /* ---------- Validation (after normalization) ---------- */
     assertEnum("relationship", relationship, ENUMS.relationship);
     assertEnum("intent", intent, ENUMS.intent);
     assertEnum("tone", tone, ENUMS.tone);
@@ -754,11 +821,10 @@ module.exports = async function handler(req, res) {
     assertEnum("risk_scan.impact", risk_scan?.impact, ENUMS.impact);
     assertEnum("risk_scan.continuity", risk_scan?.continuity, ENUMS.continuity);
 
+    if (!rawContext) throw new Error("Missing context.text (or key_facts) after normalization");
+
     /* ---------- Control flags ---------- */
     const control = computeControlFlags({ risk_scan, format, intent, tone });
-
-    const CONTEXT_MAX = Number(process.env.CB_CONTEXT_MAX_CHARS || 1400);
-    const rawContext = clampText(state.context?.text ?? "", CONTEXT_MAX);
 
     /* ---------- Guideline resolution ---------- */
     const intentGuide = GUIDELINE_MAP.intent?.[intent];
@@ -781,6 +847,7 @@ module.exports = async function handler(req, res) {
     const pkgSchema = pkgSchemaFor(pkg);
     const schemaStr = jsonSchemaString(pkgSchema);
 
+    /* ---------- Debug snapshot ---------- */
     console.log("cb_policy_snapshot", {
       pkg,
       format,
@@ -788,7 +855,10 @@ module.exports = async function handler(req, res) {
       intent,
       record_safe_required: control.record_safe_required,
       analysis_required: control.analysis_required,
-      models: { gen: pickModelDefault(), analysis: pickModelAnalysis() },
+      models: {
+        gen: pickModelDefault(),
+        analysis: pickModelAnalysis(),
+      },
     });
 
     /* =========================================================
@@ -824,7 +894,7 @@ module.exports = async function handler(req, res) {
 
       const user = buildUserPrompt({
         rawContext,
-        hint: `Meet MIN chars and stay within MAX caps. note_text must be short and practical.`,
+        hint: `Meet MIN chars; stay within MAX caps. note_text must be short and practical.`,
       });
 
       const model = pickModelDefault();
@@ -864,9 +934,12 @@ module.exports = async function handler(req, res) {
      *  2) generation (gpt-4.1-mini)
      * ======================================================= */
 
-    // (1) ANALYSIS CALL
+    // (1) ANALYSIS CALL (always for analysis_email/total)
     const analysisModel = pickModelAnalysis();
-    const analysisSchemaStr = jsonSchemaString({ required: ["analysis_text"], keys: ["analysis_text"] });
+    const analysisSchema = jsonSchemaString({
+      required: ["analysis_text"],
+      keys: ["analysis_text"],
+    });
 
     const analysisFewshot = pickFewshot({
       GUIDELINE_MAP,
@@ -883,8 +956,11 @@ module.exports = async function handler(req, res) {
       tone,
       risk_scan,
       control: { ...control, record_safe_required: true },
-      schemaStr: analysisSchemaStr,
-      fewshotExample: { analysis_text: (analysisFewshot.analysis_text || "Record-safe posture.\nFacts only.\nClear request + next step.") },
+      schemaStr: analysisSchema,
+      fewshotExample: {
+        analysis_text:
+          analysisFewshot.analysis_text || "Record-safe posture.\nFacts only; no speculation.\nClear request + next step.",
+      },
     });
 
     const analysisUser = buildUserPrompt({
@@ -907,10 +983,9 @@ module.exports = async function handler(req, res) {
       analysisObj = JSON.parse(analysisRaw);
       if (typeof analysisObj?.analysis_text !== "string") throw new Error("analysis_text missing");
     } catch {
-      const repSys = buildRepairSystem({ schemaStr: analysisSchemaStr, allowedKeys: ["analysis_text"] });
+      const repSys = buildRepairSystem({ schemaStr: analysisSchema, allowedKeys: ["analysis_text"] });
       const repUser = `Fix this into valid JSON only:\n\n${analysisRaw}`;
       const rep = await callLLM({ model: analysisModel, system: repSys, user: repUser, max_tokens: 220 });
-
       try {
         analysisObj = JSON.parse(rep);
         if (typeof analysisObj?.analysis_text !== "string") throw new Error("analysis_text missing");
@@ -921,7 +996,7 @@ module.exports = async function handler(req, res) {
 
     analysisObj.analysis_text = enforceAnalysis3Lines(analysisObj.analysis_text);
 
-    // (2) GENERATION CALL (mini) — IMPORTANT: analysis is NOT passed in (prevents bleed + saves tokens)
+    // (2) GENERATION CALL (mini)
     const genModel = pickModelDefault();
     const genPkgSchema = pkgSchemaFor(pkg);
     const genSchemaStr = jsonSchemaString(genPkgSchema);
@@ -953,10 +1028,12 @@ module.exports = async function handler(req, res) {
       },
     });
 
-    const genUser = buildUserPrompt({
-      rawContext,
-      hint: "Generate the recipient-facing text(s) only. Do not include analysis. Do not mention notes unless schema requires it.",
-    });
+    // IMPORTANT: analysis does NOT feed recipient text as factual content.
+    const genUser = safeJoin(
+      buildUserPrompt({ rawContext, hint: "Generate the recipient-facing text(s) only." }),
+      `\n\n<<<ANALYSIS_FOR_USER_ONLY>>>\n${analysisObj.analysis_text}\n<<<END_ANALYSIS_FOR_USER_ONLY>>>\n` +
+        "Do NOT reference the analysis in the recipient text. It is for the user only."
+    );
 
     const tG0 = Date.now();
     let genRaw = await callLLM({
@@ -985,8 +1062,10 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // Attach analysis_text (required)
-    genObj.analysis_text = analysisObj.analysis_text;
+    // Attach analysis_text (required in analysis_email/total)
+    if (pkg === "analysis_email" || pkg === "total") {
+      genObj.analysis_text = analysisObj.analysis_text;
+    }
 
     genObj = postprocessByPackage(pkg, genObj);
 
