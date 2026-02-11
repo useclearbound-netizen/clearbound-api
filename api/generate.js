@@ -112,13 +112,43 @@ const POLICY = {
 };
 
 /* ---------------------------
- * Request parsing
+ * Request parsing (NORMALIZED)
  * -------------------------- */
+function safeJsonParse(input) {
+  if (input == null) return null;
+
+  // 이미 object인 경우
+  if (typeof input === "object") return input;
+
+  // string인 경우만 JSON.parse 시도
+  if (typeof input === "string") {
+    const t = input.trim();
+    if (!t) return null;
+    try { return JSON.parse(t); } catch { return null; }
+  }
+
+  return null;
+}
+
 function parseState(req) {
-  // WordPress proxy may send { state: "<json>" }.
-  // Direct calls may send JSON object directly.
-  if (req?.body?.state) return JSON.parse(req.body.state);
-  return req.body || {};
+  const body = req?.body ?? {};
+
+  // WP AJAX: state가 string 또는 object 둘 다 올 수 있음
+  if (body.state != null) {
+    const parsed = safeJsonParse(body.state);
+    if (!parsed) {
+      const v = typeof body.state === "string"
+        ? body.state
+        : String(body.state);
+      throw new Error(`Invalid state JSON: ${v.slice(0, 120)}`);
+    }
+    return parsed;
+  }
+
+  // Direct JSON POST
+  if (typeof body === "object") return body;
+
+  throw new Error("Invalid request body");
 }
 
 /* ---------------------------
