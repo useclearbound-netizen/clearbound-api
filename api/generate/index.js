@@ -1,5 +1,5 @@
 // api/generate/index.js
-// Full replace (ops-ready): CORS hard check + body parsing fallback + timeout + JSON enforcement + stricter validation
+// Full replace (ops-ready): strict CORS gate + body parsing fallback + timeout + JSON enforcement + stricter validation
 
 const { computeEngineDecisions } = require("../engine/compute");
 const { loadPrompt } = require("../engine/promptLoader");
@@ -8,19 +8,20 @@ function json(res, status, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
+  // Security headers (cheap wins)
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
   res.end(JSON.stringify(body));
 }
 
 function getAllowedOrigin() {
-  // e.g. https://useclearbound.com
-  return (process.env.ALLOW_ORIGIN || "*").trim();
+  // e.g. "https://useclearbound.com" or "https://useclearbound.com,https://clearbound.app"
+  return String(process.env.ALLOW_ORIGIN || "*").trim();
 }
 
 function isOriginAllowed(reqOrigin, allow) {
-  if (!reqOrigin) return true; // allow non-browser/server-to-server
+  if (!reqOrigin) return true; // allow non-browser/server-to-server by default
   if (allow === "*") return true;
-
-  // allow can be comma-separated list
   const allowed = allow.split(",").map(s => s.trim()).filter(Boolean);
   return allowed.includes(reqOrigin);
 }
@@ -29,7 +30,6 @@ function setCors(req, res) {
   const allow = getAllowedOrigin();
   const origin = req.headers?.origin;
 
-  // If specific origin(s) are set, only echo back when matched.
   if (allow === "*") {
     res.setHeader("Access-Control-Allow-Origin", "*");
   } else if (origin && isOriginAllowed(origin, allow)) {
@@ -38,7 +38,6 @@ function setCors(req, res) {
   }
 
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  // Authorization not needed for browser→Vercel flow unless you later add auth.
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
@@ -48,17 +47,13 @@ function safeParseJson(str) {
 }
 
 async function readRawBody(req, maxBytes = 200_000) {
-  // Fallback for runtimes where req.body isn't populated
   return await new Promise((resolve, reject) => {
     let size = 0;
     let buf = "";
     req.on("data", (chunk) => {
       const s = chunk.toString("utf8");
       size += Buffer.byteLength(s, "utf8");
-      if (size > maxBytes) {
-        reject(new Error("BODY_TOO_LARGE"));
-        return;
-      }
+      if (size > maxBytes) return reject(new Error("BODY_TOO_LARGE"));
       buf += s;
     });
     req.on("end", () => resolve(buf));
@@ -67,8 +62,6 @@ async function readRawBody(req, maxBytes = 200_000) {
 }
 
 function pickModel(engine, include_analysis) {
-  // Env names:
-  // MODEL_DEFAULT, MODEL_HIGH_RISK, MODEL_ANALYSIS
   const modelDefault = process.env.MODEL_DEFAULT || "gpt-4.1-mini";
   const modelHighRisk = process.env.MODEL_HIGH_RISK || "gpt-4.1";
   const modelAnalysis = process.env.MODEL_ANALYSIS || "gpt-4.1";
@@ -78,7 +71,7 @@ function pickModel(engine, include_analysis) {
   return modelDefault;
 }
 
-async function openaiChat({ model, system, user, timeoutMs = 22_000 }) {
+async function openaiChat({ model, system, user, timeoutMs = 22_000, requestId = "" }) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY missing");
 
@@ -91,12 +84,12 @@ async function openaiChat({ model, system, user, timeoutMs = 22_000 }) {
       signal: ac.signal,
       headers: {
         "Authorization": `Bearer ${key}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        ...(requestId ? { "X-Request-Id": requestId } : {})
       },
       body: JSON.stringify({
         model,
         temperature: 0.2,
-        // Strongly push JSON-only outputs
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
@@ -122,9 +115,6 @@ async function openaiChat({ model, system, user, timeoutMs = 22_000 }) {
 }
 
 function buildPayload(state) {
-  // Accept:
-  // - backend-shaped: { context:{...paywall,risk_scan,...}, intent, tone, relationship... }
-  // - v2 UI shape (wizard state)
   const s = state || {};
 
   const paywall = s?.context?.paywall || s?.paywall || {};
@@ -164,7 +154,6 @@ function buildPayload(state) {
 }
 
 function resolveFinalControls(payload, engine) {
-  // Engine is authoritative for consistency (until you explicitly allow UI overrides).
   const tone = engine.tone_recommendation;
   const detail = engine.detail_recommendation;
   const direction = engine.direction_suggestion || "reset";
@@ -182,6 +171,12 @@ function systemPreamble() {
 
 function shouldReturnEngine() {
   return String(process.env.RETURN_ENGINE || "").trim() === "1";
+}
+
+function isJsonRequest(req) {
+  const ct = String(req.headers?.["content-type"] || "").toLowerCase();
+  // allow "application/json; charset=utf-8"
+  return ct.includes("application/json");
 }
 
 module.exports = async (req, res) => {
@@ -203,6 +198,11 @@ module.exports = async (req, res) => {
     return json(res, 405, { ok: false, error: "METHOD_NOT_ALLOWED" });
   }
 
+  // Content-Type gate (security + reduces weird failures)
+  if (!isJsonRequest(req)) {
+    return json(res, 415, { ok: false, error: "UNSUPPORTED_MEDIA_TYPE" });
+  }
+
   // Parse body (covers: req.body object / req.body string / raw stream)
   let body = req.body;
 
@@ -212,9 +212,7 @@ module.exports = async (req, res) => {
       body = safeParseJson(raw);
     } catch (e) {
       const msg = String(e?.message || e);
-      if (msg.includes("BODY_TOO_LARGE")) {
-        return json(res, 413, { ok: false, error: "BODY_TOO_LARGE" });
-      }
+      if (msg.includes("BODY_TOO_LARGE")) return json(res, 413, { ok: false, error: "BODY_TOO_LARGE" });
       return json(res, 400, { ok: false, error: "BAD_REQUEST", message: "Invalid body" });
     }
   } else if (typeof body === "string") {
@@ -225,14 +223,14 @@ module.exports = async (req, res) => {
     return json(res, 400, { ok: false, error: "BAD_REQUEST", message: "Invalid JSON body" });
   }
 
-  const state = body.state || body; // allow {state:{...}} or direct
+  const state = body.state || body;
   const payload = buildPayload(state);
 
   if (!payload.package) {
     return json(res, 400, { ok: false, error: "MISSING_PACKAGE" });
   }
 
-  // Align with your front Step 3 limits (factsMin=20)
+  // Front Step 3 facts min (대표님 기준 20)
   const facts = (payload.input.key_facts || "").trim();
   if (facts.length < 20) {
     return json(res, 400, { ok: false, error: "MISSING_FACTS", message: "Facts too short" });
@@ -254,7 +252,7 @@ module.exports = async (req, res) => {
   const promptPath =
     payload.package === "message" ? `${basePath}/message.prompt.md` :
     payload.package === "email"   ? `${basePath}/email.prompt.md` :
-    payload.package === "bundle"  ? `${basePath}/email.prompt.md` :
+    payload.package === "bundle"  ? `${basePath}/bundle.prompt.md` : // ✅ bundle 전용으로 분리
     null;
 
   if (!promptPath) {
@@ -281,6 +279,8 @@ module.exports = async (req, res) => {
     engine
   };
 
+  const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
   // 4) Main generation call
   let mainText;
   try {
@@ -288,7 +288,8 @@ module.exports = async (req, res) => {
       model,
       system: systemPreamble(),
       user: `${mainPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`,
-      timeoutMs: 22_000
+      timeoutMs: 22_000,
+      requestId
     });
   } catch (e) {
     const msg = String(e?.message || e);
@@ -333,7 +334,8 @@ module.exports = async (req, res) => {
         model: process.env.MODEL_ANALYSIS || model,
         system: systemPreamble(),
         user: `${insightPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`,
-        timeoutMs: 18_000
+        timeoutMs: 16_000, // ✅ insight는 더 짧게
+        requestId: `${requestId}-insight`
       });
     } catch (e) {
       const msg = String(e?.message || e);
