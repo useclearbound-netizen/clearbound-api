@@ -1,216 +1,171 @@
 /**
- * ClearBound Engine Logic v3.0 (LOCK)
- * - Deterministic decisions only (no advice, no prediction)
- * - Input: vNext backend state (from front)
- * - Output: fixed contract decisions
+ * ClearBound Engine Compute (v3.0 baseline)
+ * Deterministic decision logic.
  */
 
-const WEIGHTS = {
-  continuity: {
-    one_time: 0,
-    short_term: 1,
-    ongoing: 2,
-  },
-  repeat_yes: 1,
-
-  exposure: {
-    emotional_fallout: 1,
-    reputation_impact: 2,
-    documentation_sensitivity: 2,
-    they_have_leverage: 3,
-  },
-};
-
-function normalizeContinuity(v) {
-  // Front v2 sends: high | mid | low
-  // Engine v3 expects: one_time | short_term | ongoing
-  if (v === "high") return "ongoing";
-  if (v === "mid") return "short_term";
-  if (v === "low") return "one_time";
-  return null;
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function clampRiskLevelFromScore(score) {
+function mapContinuity(v) {
+  // v2: high | mid | low  (Will you need to deal again?)
+  // v3 expects: one_time | short_term | ongoing
+  if (v === "high") return "ongoing";
+  if (v === "mid") return "short_term";
+  return "one_time";
+}
+
+function weightContinuity(c) {
+  // v3 weights: one_time 0, short_term 1, ongoing 2
+  if (c === "ongoing") return 2;
+  if (c === "short_term") return 1;
+  return 0;
+}
+
+function calcRiskLevel(score) {
+  // v3 mapping: 0–2 low, 3–5 moderate, 6+ high
   if (score >= 6) return "high";
   if (score >= 3) return "moderate";
   return "low";
 }
 
-function safeArray(v) {
-  return Array.isArray(v) ? v : [];
-}
-
-/**
- * Map current Front v2 signals -> Engine v3 flags
- * NOTE: We keep this mapping deterministic and conservative.
- */
-function deriveInternalFlags(input) {
-  const relationship = input?.relationship?.value || null;
-
-  const riskScan = input?.context?.risk_scan || {};
-  const continuityRaw = riskScan?.continuity || null; // high|mid|low
-  const continuity = normalizeContinuity(continuityRaw);
-
-  const mainConcerns = safeArray(input?.context?.main_concerns); // e.g. ["repeat","document",...]
-  const constraints = safeArray(input?.context?.constraints);
-
-  // v3 input flags (best-effort mapping from current UI)
-  const repeat_flag = mainConcerns.includes("repeat"); // "It keeps happening"
-  const doc_flag = mainConcerns.includes("document"); // "I want this documented"
-
-  // leverage not collected in current UI => always false for now
-  const leverage_flag = false;
-
-  // ongoing_flag derived from continuity
-  const ongoing_flag = continuity === "ongoing";
-
-  /**
-   * exposure[] mapping (v3 weights table)
-   * - documentation_sensitivity: from "document"
-   * - emotional_fallout: from "impact"=high OR relationship intimate/personal with "no_emotion"
-   * - reputation_impact: deterministic rule for social/peripheral + impact=high (more record/public-facing)
-   */
-  const impactRaw = riskScan?.impact || null; // high|low
-  const exposure = [];
-
-  if (doc_flag) exposure.push("documentation_sensitivity");
-
-  if (impactRaw === "high") exposure.push("emotional_fallout");
-
-  if ((relationship === "social" || relationship === "peripheral") && impactRaw === "high") {
-    exposure.push("reputation_impact");
-  }
-
-  // If user explicitly wants to avoid sounding emotional, treat as emotional-fallout sensitivity (no extra score)
-  // We do NOT add a new weight for this; we only keep it as a constraint signal.
-  const avoid_emotion = constraints.includes("no_emotion");
-
-  return {
-    relationship,
-    continuity, // one_time|short_term|ongoing
-    impactRaw,  // high|low
-    exposure,   // array of v3 exposure flags
-    repeat_flag,
-    doc_flag,
-    leverage_flag,
-    ongoing_flag,
-    avoid_emotion,
-  };
-}
-
-function calcRiskScore(flags) {
-  const c = flags.continuity;
-  const continuity_weight = c ? (WEIGHTS.continuity[c] ?? 0) : 0;
-
-  const repeat_weight = flags.repeat_flag ? WEIGHTS.repeat_yes : 0;
-
-  const exposure_weight_sum = (flags.exposure || []).reduce((sum, key) => {
-    return sum + (WEIGHTS.exposure[key] ?? 0);
-  }, 0);
-
-  return continuity_weight + repeat_weight + exposure_weight_sum;
-}
-
-function calcRecordSafeLevel(flags) {
-  const hasDoc = (flags.exposure || []).includes("documentation_sensitivity");
-  const hasReputation = (flags.exposure || []).includes("reputation_impact");
-
-  if (hasDoc) return 2;
-  if (hasReputation) return 1;
+function calcRecordSafeLevel({ documentation_sensitivity, reputation_impact }) {
+  // v3:
+  // if documentation_sensitivity -> 2
+  // elif reputation_impact -> 1
+  // else -> 0
+  if (documentation_sensitivity) return 2;
+  if (reputation_impact) return 1;
   return 0;
 }
 
-function pickDirectionSuggestion({ risk_level, record_safe_level, flags }) {
-  // v3: shown ONLY when user selects "I'm not sure"
-  // Front currently does not capture this explicitly, so we gate on input.context.direction_sure === false
-  // (You can wire this from UI later)
-  const unsure = flags?.direction_unsure === true;
-  if (!unsure) return null;
-
-  // Baseline logic (LOCK)
-  if (risk_level === "low" && flags.continuity === "one_time" && !flags.repeat_flag) {
-    return { value: "maintain", reason: "Based on interaction signals and continuity profile, maintain aligns with the present context." };
-  }
-
-  if (record_safe_level === 2 && flags.leverage_flag && flags.ongoing_flag && flags.repeat_flag) {
-    return { value: "disengage", reason: "Based on ongoing interaction and documentation signals, disengage fits the present context." };
-  }
-
-  return { value: "reset", reason: "Based on interaction signals and documentation considerations, reset aligns with the present context." };
+function toneRecommendation({ risk_level, record_safe_level }) {
+  // v3 baseline:
+  // if record_safe_level == 2 -> formal
+  // elif risk_level == high -> neutral
+  // elif risk_level == moderate -> neutral
+  // else -> calm
+  if (record_safe_level === 2) return "formal";
+  if (risk_level === "high") return "neutral";
+  if (risk_level === "moderate") return "neutral";
+  return "calm";
 }
 
-function pickTone({ risk_level, record_safe_level }) {
-  // Baseline logic (LOCK)
-  if (record_safe_level === 2) return { value: "formal", reason: "Based on documentation signals in the current interaction context." };
-  if (risk_level === "high") return { value: "neutral", reason: "Based on higher-risk signals in the current interaction context." };
-  if (risk_level === "moderate") return { value: "neutral", reason: "Based on moderate signals in the current interaction context." };
-  return { value: "calm", reason: "Based on lower-risk signals in the current interaction context." };
+function detailRecommendation({ risk_level, record_safe_level, ongoing_flag }) {
+  // v3 baseline:
+  // if record_safe_level == 2 -> detailed
+  // elif risk_level >= moderate or ongoing_flag -> standard
+  // else -> concise
+  if (record_safe_level === 2) return "detailed";
+  if (risk_level === "high" || risk_level === "moderate" || ongoing_flag) return "standard";
+  return "concise";
 }
 
-function pickDetail({ risk_level, record_safe_level, flags }) {
-  // Baseline logic (LOCK)
-  if (record_safe_level === 2) return { value: "detailed", reason: "Based on documentation signals and continuity profile in this interaction context." };
-  if (risk_level !== "low" || flags.ongoing_flag) return { value: "standard", reason: "Based on continuity signals and interaction context considerations." };
-  return { value: "concise", reason: "Based on one-time signals and minimal continuity considerations in this context." };
-}
-
-function pickInsightCandor(risk_level) {
+function candorLevel(risk_level) {
+  // v3 table
   if (risk_level === "high") return "high";
   if (risk_level === "moderate") return "moderate";
   return "low";
 }
 
+function directionSuggestion({ risk_level, record_safe_level, continuity, repeat_flag, leverage_flag, ongoing_flag }) {
+  // v3 baseline logic
+  if (risk_level === "low" && continuity === "one_time" && !repeat_flag) return "maintain";
+  if (record_safe_level === 2 && leverage_flag && ongoing_flag && repeat_flag) return "disengage";
+  return "reset";
+}
+
+function buildReasonSignals(kind) {
+  // LOCK lexicon: must include plural "signals"
+  // Keep reasons short and context-only (we won’t enforce exact word counts here).
+  if (kind === "direction") return "Based on continuity and documentation signals, this aligns with the present context.";
+  if (kind === "tone") return "Selected from documentation and interaction signals.";
+  if (kind === "detail") return "Selected from continuity and interaction signals.";
+  return "Based on interaction signals.";
+}
+
 /**
- * Public compute
- * Output Contract (v3.0):
- * 1) risk_level
- * 2) record_safe_level
- * 3) direction_suggestion (only if user is unsure)
- * 4) tone_recommendation
- * 5) detail_recommendation
- * 6) insight_candor_level
- * 7) constraints
+ * compute(state)
+ * Accepts front “wizard state” (your v2 structure).
+ * Returns fixed engine output contract.
  */
-function computeEngineDecision(input) {
-  const flags = deriveInternalFlags(input);
+function compute(state = {}) {
+  const continuity_raw = state?.risk_scan?.continuity || null;
+  const continuity = mapContinuity(continuity_raw);
+  const continuity_weight = weightContinuity(continuity);
 
-  // Optional future hook (UI can set this later)
-  flags.direction_unsure = input?.context?.direction_unsure === true;
+  // v2 “repeat” is in main_concerns
+  const main_concerns = Array.isArray(state?.context_builder?.main_concerns)
+    ? state.context_builder.main_concerns
+    : [];
 
-  const risk_score = calcRiskScore(flags);
-  const risk_level = clampRiskLevelFromScore(risk_score);
+  const repeat_flag = main_concerns.includes("repeat"); // happened_before proxy
+  const doc_flag = main_concerns.includes("document");  // documentation_sensitivity proxy
 
-  const record_safe_level = calcRecordSafeLevel(flags);
+  // v2 “impact” = could have consequences later? high/low
+  const impact_raw = state?.risk_scan?.impact || null;
+  const reputation_impact = impact_raw === "high"; // proxy
 
-  const direction_suggestion = pickDirectionSuggestion({ risk_level, record_safe_level, flags });
+  const ongoing_flag = continuity === "ongoing";
+  const leverage_flag = false; // not collected in v2 yet (keep deterministic false)
 
-  const tone_recommendation = pickTone({ risk_level, record_safe_level });
-  const detail_recommendation = pickDetail({ risk_level, record_safe_level, flags });
+  // exposure weights (v3 table)
+  const repeat_weight = repeat_flag ? 1 : 0;
+  const reputation_weight = reputation_impact ? 2 : 0;
+  const documentation_weight = doc_flag ? 2 : 0;
+  const leverage_weight = leverage_flag ? 3 : 0;
 
-  const insight_candor_level = pickInsightCandor(risk_level);
+  const risk_score = continuity_weight + repeat_weight + reputation_weight + documentation_weight + leverage_weight;
+  const risk_level = calcRiskLevel(risk_score);
+
+  const record_safe_level = calcRecordSafeLevel({
+    documentation_sensitivity: doc_flag,
+    reputation_impact
+  });
+
+  const tone_recommendation = toneRecommendation({ risk_level, record_safe_level });
+  const detail_recommendation = detailRecommendation({ risk_level, record_safe_level, ongoing_flag });
+  const insight_candor_level = candorLevel(risk_level);
 
   const constraints = {
     tone_soften_if_high_risk: risk_level === "high",
     record_safe_mode: record_safe_level === 2,
-    forbidden_patterns_enabled: true,
+    forbidden_patterns_enabled: true
   };
 
-  return {
-    // (fixed contract)
+  // direction_suggestion shown only when user selects "I'm not sure"
+  // v2 doesn’t collect that yet, so compute it but allow caller to hide it.
+  const suggested_direction = directionSuggestion({
     risk_level,
     record_safe_level,
-    direction_suggestion, // null or {value, reason}
-    tone_recommendation,  // {value, reason}
-    detail_recommendation,// {value, reason}
+    continuity,
+    repeat_flag,
+    leverage_flag,
+    ongoing_flag
+  });
+
+  return {
+    risk_level,
+    record_safe_level,
+    direction_suggestion: suggested_direction,
+    tone_recommendation,
+    detail_recommendation,
     insight_candor_level,
     constraints,
 
-    // (debug extras - safe to keep internal; remove later if you want)
+    // debug-safe internals (optional; you can remove later)
     _debug: {
-      risk_score,
-      flags,
+      continuity,
+      risk_score: clamp(risk_score, 0, 99),
+      flags: { ongoing_flag, repeat_flag, leverage_flag, doc_flag, reputation_impact }
     },
+
+    reasons: {
+      direction: buildReasonSignals("direction"),
+      tone: buildReasonSignals("tone"),
+      detail: buildReasonSignals("detail")
+    }
   };
 }
 
-module.exports = { computeEngineDecision };
+module.exports = { compute };
