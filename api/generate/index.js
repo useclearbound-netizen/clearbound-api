@@ -1,6 +1,6 @@
 // api/generate/index.js
-// Full replace (ops-ready): strict CORS gate + body parsing fallback + timeout + JSON enforcement + strict validation
-// ✅ Fix: Insight is returned as an OBJECT (data.insight), not JSON string.
+// Full replace: strict CORS gate + robust body parsing + prompt repo support + JSON enforcement
+// + Insight returns as an object (for UI rendering + human-friendly download formatting)
 
 const { computeEngineDecisions } = require("../engine/compute");
 const { loadPrompt } = require("../engine/promptLoader");
@@ -15,14 +15,14 @@ function json(res, status, body) {
 }
 
 function getAllowedOrigin() {
-  // e.g. "https://useclearbound.com" or "https://useclearbound.com,https://clearbound.app"
+  // e.g. "https://useclearbound.com,https://clearbound.app"
   return String(process.env.ALLOW_ORIGIN || "*").trim();
 }
 
 function isOriginAllowed(reqOrigin, allow) {
-  if (!reqOrigin) return true; // allow non-browser / server-to-server
+  if (!reqOrigin) return true; // allow server-to-server
   if (allow === "*") return true;
-  const allowed = allow.split(",").map((s) => s.trim()).filter(Boolean);
+  const allowed = allow.split(",").map(s => s.trim()).filter(Boolean);
   return allowed.includes(reqOrigin);
 }
 
@@ -132,7 +132,8 @@ function buildPayload(state) {
   const user_tone = s?.tone?.value || s?.tone || null;
   const user_depth = ctx.depth || s?.depth || null;
 
-  const include_analysis = !!paywall.include_analysis;
+  // NOTE: your UI uses addon_insight; legacy uses include_analysis
+  const include_analysis = !!(paywall.addon_insight ?? paywall.include_analysis);
 
   return {
     package: pkg, // message|email|bundle
@@ -181,7 +182,6 @@ function isJsonRequest(req) {
 module.exports = async (req, res) => {
   setCors(req, res);
 
-  // Hard origin gate when ALLOW_ORIGIN is not "*"
   const allow = getAllowedOrigin();
   const origin = req.headers?.origin;
   if (allow !== "*" && origin && !isOriginAllowed(origin, allow)) {
@@ -201,7 +201,7 @@ module.exports = async (req, res) => {
     return json(res, 415, { ok: false, error: "UNSUPPORTED_MEDIA_TYPE" });
   }
 
-  // Parse body (covers: req.body object / req.body string / raw stream)
+  // Parse body
   let body = req.body;
 
   if (!body) {
@@ -228,7 +228,7 @@ module.exports = async (req, res) => {
     return json(res, 400, { ok: false, error: "MISSING_PACKAGE" });
   }
 
-  // Facts min gate
+  // Facts min gate (대표님 기준)
   const facts = (payload.input.key_facts || "").trim();
   if (facts.length < 20) {
     return json(res, 400, { ok: false, error: "MISSING_FACTS", message: "Facts too short" });
@@ -313,13 +313,15 @@ module.exports = async (req, res) => {
   const out = {
     message_text: mainObj.message_text || mainObj.bundle_message_text || null,
     email_text: mainObj.email_text || null,
-    note_text: mainObj.note_text || null,
 
-    // ✅ Insight object will be attached as out.insight when include_analysis is true
-    insight: null
+    // ✅ insight: object (preferred for UI)
+    insight: null,
+
+    // ✅ legacy/debug: string form (optional)
+    analysis_text: null
   };
 
-  // 5) Optional Insight call (only if include_analysis)
+  // 5) Optional Insight call
   if (payload.include_analysis) {
     let insightPrompt;
     try {
@@ -348,14 +350,16 @@ module.exports = async (req, res) => {
     }
 
     const insightObj = safeParseJson(insightText);
+
+    // ✅ Prefer object for UI
     if (insightObj && typeof insightObj === "object") {
-      out.insight = insightObj; // ✅ object, not string
+      out.insight = insightObj;
+      // keep a string version only for debugging (not required by UI)
+      out.analysis_text = JSON.stringify(insightObj, null, 2);
     } else {
-      out.insight = {
-        insight_title: "Strategic Insight",
-        insight_sections: [],
-        disclaimer_line: "This insight reflects interaction signals and structure choices, not outcomes or advice."
-      };
+      // fallback: keep as raw string if model misbehaves
+      out.insight = { insight_title: "Strategic Insight", insight_sections: [], disclaimer_line: String(insightText || "") };
+      out.analysis_text = String(insightText || "");
     }
   }
 
