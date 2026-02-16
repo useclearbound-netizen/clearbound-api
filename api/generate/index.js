@@ -1,5 +1,6 @@
 // api/generate/index.js
-// Full replace (ops-ready): strict CORS gate + body parsing fallback + timeout + JSON enforcement + stricter validation
+// Full replace (ops-ready): strict CORS gate + body parsing fallback + timeout + JSON enforcement + strict validation
+// ✅ Fix: Insight is returned as an OBJECT (data.insight), not JSON string.
 
 const { computeEngineDecisions } = require("../engine/compute");
 const { loadPrompt } = require("../engine/promptLoader");
@@ -8,7 +9,6 @@ function json(res, status, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
-  // Security headers (cheap wins)
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.end(JSON.stringify(body));
@@ -20,9 +20,9 @@ function getAllowedOrigin() {
 }
 
 function isOriginAllowed(reqOrigin, allow) {
-  if (!reqOrigin) return true; // allow non-browser/server-to-server by default
+  if (!reqOrigin) return true; // allow non-browser / server-to-server
   if (allow === "*") return true;
-  const allowed = allow.split(",").map(s => s.trim()).filter(Boolean);
+  const allowed = allow.split(",").map((s) => s.trim()).filter(Boolean);
   return allowed.includes(reqOrigin);
 }
 
@@ -175,7 +175,6 @@ function shouldReturnEngine() {
 
 function isJsonRequest(req) {
   const ct = String(req.headers?.["content-type"] || "").toLowerCase();
-  // allow "application/json; charset=utf-8"
   return ct.includes("application/json");
 }
 
@@ -198,7 +197,6 @@ module.exports = async (req, res) => {
     return json(res, 405, { ok: false, error: "METHOD_NOT_ALLOWED" });
   }
 
-  // Content-Type gate (security + reduces weird failures)
   if (!isJsonRequest(req)) {
     return json(res, 415, { ok: false, error: "UNSUPPORTED_MEDIA_TYPE" });
   }
@@ -230,7 +228,7 @@ module.exports = async (req, res) => {
     return json(res, 400, { ok: false, error: "MISSING_PACKAGE" });
   }
 
-  // Front Step 3 facts min (대표님 기준 20)
+  // Facts min gate
   const facts = (payload.input.key_facts || "").trim();
   if (facts.length < 20) {
     return json(res, 400, { ok: false, error: "MISSING_FACTS", message: "Facts too short" });
@@ -252,7 +250,7 @@ module.exports = async (req, res) => {
   const promptPath =
     payload.package === "message" ? `${basePath}/message.prompt.md` :
     payload.package === "email"   ? `${basePath}/email.prompt.md` :
-    payload.package === "bundle"  ? `${basePath}/bundle.prompt.md` : // ✅ bundle 전용으로 분리
+    payload.package === "bundle"  ? `${basePath}/bundle.prompt.md` :
     null;
 
   if (!promptPath) {
@@ -312,11 +310,13 @@ module.exports = async (req, res) => {
   }
 
   // Normalize output
-  let out = {
+  const out = {
     message_text: mainObj.message_text || mainObj.bundle_message_text || null,
     email_text: mainObj.email_text || null,
     note_text: mainObj.note_text || null,
-    analysis_text: null
+
+    // ✅ Insight object will be attached as out.insight when include_analysis is true
+    insight: null
   };
 
   // 5) Optional Insight call (only if include_analysis)
@@ -334,7 +334,7 @@ module.exports = async (req, res) => {
         model: process.env.MODEL_ANALYSIS || model,
         system: systemPreamble(),
         user: `${insightPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`,
-        timeoutMs: 16_000, // ✅ insight는 더 짧게
+        timeoutMs: 16_000,
         requestId: `${requestId}-insight`
       });
     } catch (e) {
@@ -348,9 +348,15 @@ module.exports = async (req, res) => {
     }
 
     const insightObj = safeParseJson(insightText);
-    out.analysis_text = (insightObj && typeof insightObj === "object")
-      ? JSON.stringify(insightObj, null, 2)
-      : String(insightText || "");
+    if (insightObj && typeof insightObj === "object") {
+      out.insight = insightObj; // ✅ object, not string
+    } else {
+      out.insight = {
+        insight_title: "Strategic Insight",
+        insight_sections: [],
+        disclaimer_line: "This insight reflects interaction signals and structure choices, not outcomes or advice."
+      };
+    }
   }
 
   // Bundle: ensure both exist if provided
