@@ -1,4 +1,5 @@
 // api/generate/index.js
+// Full replace (ops-ready): CORS hard check + body parsing fallback + timeout + JSON enforcement + stricter validation
 
 const { computeEngineDecisions } = require("../engine/compute");
 const { loadPrompt } = require("../engine/promptLoader");
@@ -6,14 +7,38 @@ const { loadPrompt } = require("../engine/promptLoader");
 function json(res, status, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
   res.end(JSON.stringify(body));
 }
 
+function getAllowedOrigin() {
+  // e.g. https://useclearbound.com
+  return (process.env.ALLOW_ORIGIN || "*").trim();
+}
+
+function isOriginAllowed(reqOrigin, allow) {
+  if (!reqOrigin) return true; // allow non-browser/server-to-server
+  if (allow === "*") return true;
+
+  // allow can be comma-separated list
+  const allowed = allow.split(",").map(s => s.trim()).filter(Boolean);
+  return allowed.includes(reqOrigin);
+}
+
 function setCors(req, res) {
-  const allow = process.env.ALLOW_ORIGIN || "*";
-  res.setHeader("Access-Control-Allow-Origin", allow);
-  res.setHeader("Vary", "Origin");
+  const allow = getAllowedOrigin();
+  const origin = req.headers?.origin;
+
+  // If specific origin(s) are set, only echo back when matched.
+  if (allow === "*") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && isOriginAllowed(origin, allow)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  // Authorization not needed for browser→Vercel flow unless you later add auth.
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
@@ -22,8 +47,27 @@ function safeParseJson(str) {
   try { return JSON.parse(str); } catch { return null; }
 }
 
+async function readRawBody(req, maxBytes = 200_000) {
+  // Fallback for runtimes where req.body isn't populated
+  return await new Promise((resolve, reject) => {
+    let size = 0;
+    let buf = "";
+    req.on("data", (chunk) => {
+      const s = chunk.toString("utf8");
+      size += Buffer.byteLength(s, "utf8");
+      if (size > maxBytes) {
+        reject(new Error("BODY_TOO_LARGE"));
+        return;
+      }
+      buf += s;
+    });
+    req.on("end", () => resolve(buf));
+    req.on("error", (e) => reject(e));
+  });
+}
+
 function pickModel(engine, include_analysis) {
-  // Env names your latest screenshot uses:
+  // Env names:
   // MODEL_DEFAULT, MODEL_HIGH_RISK, MODEL_ANALYSIS
   const modelDefault = process.env.MODEL_DEFAULT || "gpt-4.1-mini";
   const modelHighRisk = process.env.MODEL_HIGH_RISK || "gpt-4.1";
@@ -34,50 +78,58 @@ function pickModel(engine, include_analysis) {
   return modelDefault;
 }
 
-async function openaiChat({ model, system, user }) {
+async function openaiChat({ model, system, user, timeoutMs = 22_000 }) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY missing");
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${key}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ]
-    })
-  });
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
 
-  const raw = await r.text();
-  const data = safeParseJson(raw);
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        "Authorization": `Bearer ${key}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.2,
+        // Strongly push JSON-only outputs
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ]
+      })
+    });
 
-  if (!r.ok) {
-    const msg = data?.error?.message || raw.slice(0, 300);
-    throw new Error(`OPENAI_FAILED ${r.status} ${msg}`);
+    const raw = await r.text();
+    const data = safeParseJson(raw);
+
+    if (!r.ok) {
+      const msg = data?.error?.message || raw.slice(0, 300);
+      throw new Error(`OPENAI_FAILED ${r.status} ${msg}`);
+    }
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) throw new Error("OPENAI_EMPTY");
+    return text;
+  } finally {
+    clearTimeout(t);
   }
-
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text) throw new Error("OPENAI_EMPTY");
-  return text;
 }
 
 function buildPayload(state) {
-  // Front sends a "state" that may already be backend-shaped.
-  // We accept:
-  // - direct: { context: { ... paywall ... risk_scan ... } , intent, tone, relationship ... }
-  // - or v2 UI shape as-is (your wizard currently holds it)
+  // Accept:
+  // - backend-shaped: { context:{...paywall,risk_scan,...}, intent, tone, relationship... }
+  // - v2 UI shape (wizard state)
   const s = state || {};
 
   const paywall = s?.context?.paywall || s?.paywall || {};
   const pkg = paywall.package || null;
 
-  // Extract facts + signals for engine
   const ctx = s?.context || {};
   const risk_scan = ctx.risk_scan || s?.risk_scan || {};
   const situation_type = ctx.situation_type || (s?.context_builder?.situation_type) || null;
@@ -86,7 +138,6 @@ function buildPayload(state) {
   const main_concerns = ctx.main_concerns || (s?.context_builder?.main_concerns) || [];
   const constraints = ctx.constraints || (s?.context_builder?.constraints) || [];
 
-  // user-selected (optional)
   const user_intent = s?.intent?.value || s?.intent || null;
   const user_tone = s?.tone?.value || s?.tone || null;
   const user_depth = ctx.depth || s?.depth || null;
@@ -94,7 +145,7 @@ function buildPayload(state) {
   const include_analysis = !!paywall.include_analysis;
 
   return {
-    package: pkg,                       // message|email|bundle
+    package: pkg, // message|email|bundle
     include_analysis,
     input: {
       situation_type,
@@ -113,15 +164,10 @@ function buildPayload(state) {
 }
 
 function resolveFinalControls(payload, engine) {
-  // Engine is authoritative for tone/detail unless UI explicitly locks it later.
-  // For now: engine recommendation wins for consistency.
+  // Engine is authoritative for consistency (until you explicitly allow UI overrides).
   const tone = engine.tone_recommendation;
   const detail = engine.detail_recommendation;
-
-  // Direction is only “shown” when “not sure” exists.
-  // But we still include a direction field for prompts to stabilize posture.
   const direction = engine.direction_suggestion || "reset";
-
   return { tone, detail, direction };
 }
 
@@ -130,12 +176,23 @@ function systemPreamble() {
     "You are ClearBound.",
     "You generate structured communication drafts.",
     "You do not provide advice, do not predict outcomes, do not use legal framing.",
-    "Return JSON only."
+    "Return ONE JSON object only. No markdown. No extra text."
   ].join("\n");
+}
+
+function shouldReturnEngine() {
+  return String(process.env.RETURN_ENGINE || "").trim() === "1";
 }
 
 module.exports = async (req, res) => {
   setCors(req, res);
+
+  // Hard origin gate when ALLOW_ORIGIN is not "*"
+  const allow = getAllowedOrigin();
+  const origin = req.headers?.origin;
+  if (allow !== "*" && origin && !isOriginAllowed(origin, allow)) {
+    return json(res, 403, { ok: false, error: "ORIGIN_NOT_ALLOWED" });
+  }
 
   if (req.method === "OPTIONS") {
     res.statusCode = 204;
@@ -146,9 +203,24 @@ module.exports = async (req, res) => {
     return json(res, 405, { ok: false, error: "METHOD_NOT_ALLOWED" });
   }
 
-  // Parse body (Vercel may pass object or string depending on runtime)
+  // Parse body (covers: req.body object / req.body string / raw stream)
   let body = req.body;
-  if (typeof body === "string") body = safeParseJson(body);
+
+  if (!body) {
+    try {
+      const raw = await readRawBody(req);
+      body = safeParseJson(raw);
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (msg.includes("BODY_TOO_LARGE")) {
+        return json(res, 413, { ok: false, error: "BODY_TOO_LARGE" });
+      }
+      return json(res, 400, { ok: false, error: "BAD_REQUEST", message: "Invalid body" });
+    }
+  } else if (typeof body === "string") {
+    body = safeParseJson(body);
+  }
+
   if (!body || typeof body !== "object") {
     return json(res, 400, { ok: false, error: "BAD_REQUEST", message: "Invalid JSON body" });
   }
@@ -160,9 +232,10 @@ module.exports = async (req, res) => {
     return json(res, 400, { ok: false, error: "MISSING_PACKAGE" });
   }
 
+  // Align with your front Step 3 limits (factsMin=20)
   const facts = (payload.input.key_facts || "").trim();
-  if (facts.length < 5) {
-    return json(res, 400, { ok: false, error: "MISSING_FACTS" });
+  if (facts.length < 20) {
+    return json(res, 400, { ok: false, error: "MISSING_FACTS", message: "Facts too short" });
   }
 
   // 1) Engine compute (deterministic)
@@ -201,7 +274,6 @@ module.exports = async (req, res) => {
     include_analysis: payload.include_analysis,
     input: {
       ...payload.input,
-      // add “controls” so prompts don’t guess
       tone: controls.tone,
       detail: controls.detail,
       direction: controls.direction
@@ -215,10 +287,17 @@ module.exports = async (req, res) => {
     mainText = await openaiChat({
       model,
       system: systemPreamble(),
-      user: `${mainPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`
+      user: `${mainPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`,
+      timeoutMs: 22_000
     });
   } catch (e) {
-    return json(res, 502, { ok: false, error: "GENERATION_FAILED", message: String(e?.message || e) });
+    const msg = String(e?.message || e);
+    const isTimeout = msg.includes("aborted") || msg.includes("AbortError");
+    return json(res, 502, {
+      ok: false,
+      error: isTimeout ? "GENERATION_TIMEOUT" : "GENERATION_FAILED",
+      message: msg
+    });
   }
 
   const mainObj = safeParseJson(mainText);
@@ -235,7 +314,7 @@ module.exports = async (req, res) => {
   let out = {
     message_text: mainObj.message_text || mainObj.bundle_message_text || null,
     email_text: mainObj.email_text || null,
-    note_text: null,
+    note_text: mainObj.note_text || null,
     analysis_text: null
   };
 
@@ -253,26 +332,33 @@ module.exports = async (req, res) => {
       insightText = await openaiChat({
         model: process.env.MODEL_ANALYSIS || model,
         system: systemPreamble(),
-        user: `${insightPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`
+        user: `${insightPrompt}\n\n---\n\nPAYLOAD_JSON:\n${JSON.stringify(llmInput)}`,
+        timeoutMs: 18_000
       });
     } catch (e) {
-      return json(res, 502, { ok: false, error: "INSIGHT_FAILED", message: String(e?.message || e) });
+      const msg = String(e?.message || e);
+      const isTimeout = msg.includes("aborted") || msg.includes("AbortError");
+      return json(res, 502, {
+        ok: false,
+        error: isTimeout ? "INSIGHT_TIMEOUT" : "INSIGHT_FAILED",
+        message: msg
+      });
     }
 
     const insightObj = safeParseJson(insightText);
-    if (insightObj && typeof insightObj === "object") {
-      // store as a single string block for now (front can render cards later)
-      out.analysis_text = JSON.stringify(insightObj, null, 2);
-    } else {
-      out.analysis_text = insightText; // fallback
-    }
+    out.analysis_text = (insightObj && typeof insightObj === "object")
+      ? JSON.stringify(insightObj, null, 2)
+      : String(insightText || "");
   }
 
-  // Bundle: ensure both message + email exist if possible
+  // Bundle: ensure both exist if provided
   if (payload.package === "bundle") {
     out.message_text = mainObj.bundle_message_text || out.message_text || null;
     out.email_text = mainObj.email_text || out.email_text || null;
   }
 
-  return json(res, 200, { ok: true, data: out, engine });
+  const response = { ok: true, data: out };
+  if (shouldReturnEngine()) response.engine = engine;
+
+  return json(res, 200, response);
 };
