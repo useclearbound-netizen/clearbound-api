@@ -1,36 +1,48 @@
-// engine/promptLoader.js
+/**
+ * Prompt Loader
+ * - Loads prompt files from GitHub raw
+ * - Simple in-memory cache
+ */
 
 const CACHE = {};
-const TTL = 1000 * 60 * 5; // 5 minutes
+const CACHE_TTL = 1000 * 60 * 5; // 5 minutes
 
-function rawUrl(repo, branch, path) {
-  return `https://raw.githubusercontent.com/${repo}/${branch}/${path}`;
-}
+function buildRawUrl(path) {
+  const repo = process.env.PROMPTS_REPO;
+  const ref = process.env.PROMPTS_REF || "main";
 
-async function fetchPrompt({ repo, branch, path }) {
-  const key = `${repo}:${branch}:${path}`;
-  const now = Date.now();
-
-  if (CACHE[key] && (now - CACHE[key].time < TTL)) {
-    return CACHE[key].value;
+  if (!repo) {
+    throw new Error("PROMPTS_REPO env missing");
   }
 
-  const url = rawUrl(repo, branch, path);
+  return `https://raw.githubusercontent.com/${repo}/${ref}/${path}`;
+}
 
+async function fetchPrompt(path) {
+  const now = Date.now();
+  const cached = CACHE[path];
+
+  if (cached && cached.expires > now) {
+    return cached.value;
+  }
+
+  const url = buildRawUrl(path);
   const res = await fetch(url);
 
   if (!res.ok) {
-    throw new Error(`Prompt fetch failed: ${path}`);
+    throw new Error(`Failed to load prompt: ${path}`);
   }
 
   const text = await res.text();
 
-  CACHE[key] = {
+  CACHE[path] = {
     value: text,
-    time: now
+    expires: now + CACHE_TTL,
   };
 
   return text;
 }
 
-module.exports = { fetchPrompt };
+module.exports = {
+  fetchPrompt,
+};
