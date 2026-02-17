@@ -1,6 +1,10 @@
 // api/generate/index.js
 // Full replace: strict CORS gate + robust body parsing + prompt repo support + JSON enforcement
 // + Insight returns as an object (for UI rendering + human-friendly download formatting)
+// ✅ FIXES (2026-02-16)
+// - engine/index.js mismatch no longer relied on
+// - payload now supports v3-native: continuity / happened_before / exposure
+// - user-selected tone/detail/direction respected (engine used as fallback defaults only)
 
 const { computeEngineDecisions } = require("../engine/compute");
 const { loadPrompt } = require("../engine/promptLoader");
@@ -117,6 +121,7 @@ async function openaiChat({ model, system, user, timeoutMs = 22_000, requestId =
 function buildPayload(state) {
   const s = state || {};
 
+  // UI sends: { state: payloadState } where payloadState has context/paywall + tone/detail/direction top-level
   const paywall = s?.context?.paywall || s?.paywall || {};
   const pkg = paywall.package || null;
 
@@ -128,11 +133,17 @@ function buildPayload(state) {
   const main_concerns = ctx.main_concerns || (s?.context_builder?.main_concerns) || [];
   const constraints = ctx.constraints || (s?.context_builder?.constraints) || [];
 
+  // ✅ v3-native (optional but preferred when present)
+  const continuity = ctx.continuity ?? s?.continuity ?? null;                // one_time|short_term|ongoing
+  const happened_before = ctx.happened_before ?? s?.happened_before ?? null; // boolean|null
+  const exposure = ctx.exposure ?? s?.exposure ?? null;                      // array|null
+  const leverage_flag = ctx.leverage_flag ?? s?.leverage_flag ?? null;       // optional boolean
+
   const user_intent = s?.intent?.value || s?.intent || null;
-  const user_tone = s?.tone?.value || s?.tone || null;
+  const user_tone = s?.user_tone?.value || s?.user_tone || s?.user_tone_hint || null;
   const user_depth = ctx.depth || s?.depth || null;
 
-  // NOTE: your UI uses addon_insight; legacy uses include_analysis
+  // UI uses addon_insight; legacy uses include_analysis
   const include_analysis = !!(paywall.addon_insight ?? paywall.include_analysis);
 
   return {
@@ -142,23 +153,37 @@ function buildPayload(state) {
       situation_type,
       risk_scan: {
         impact: risk_scan.impact || null,
-        continuity: risk_scan.continuity || null
+        continuity: risk_scan.continuity || null // high|mid|low (legacy) OR null
       },
+      // ✅ v3-native passthrough
+      continuity,
+      happened_before,
+      exposure: Array.isArray(exposure) ? exposure : (exposure == null ? null : []),
+      leverage_flag: (typeof leverage_flag === "boolean") ? leverage_flag : null,
+
       key_facts: String(key_facts || ""),
       main_concerns: Array.isArray(main_concerns) ? main_concerns : [],
       constraints: Array.isArray(constraints) ? constraints : [],
       user_intent,
       user_tone,
-      user_depth
+      user_depth,
+
+      // ✅ top-level controls from UI (authoritative when present)
+      tone: s?.tone?.value || s?.tone || null,
+      detail: s?.detail?.value || s?.detail || null,
+      direction: s?.direction?.value || s?.direction || null
     }
   };
 }
 
 function resolveFinalControls(payload, engine) {
-  const tone = engine.tone_recommendation;
-  const detail = engine.detail_recommendation;
-  const direction = engine.direction_suggestion || "reset";
-  return { tone, detail, direction };
+  // ✅ User selections win; engine provides fallback defaults
+  const inp = payload?.input || {};
+  return {
+    tone: inp.tone || engine.tone_recommendation,
+    detail: inp.detail || engine.detail_recommendation,
+    direction: inp.direction || engine.direction_suggestion || "reset"
+  };
 }
 
 function systemPreamble() {
@@ -228,7 +253,7 @@ module.exports = async (req, res) => {
     return json(res, 400, { ok: false, error: "MISSING_PACKAGE" });
   }
 
-  // Facts min gate (대표님 기준)
+  // Facts min gate
   const facts = (payload.input.key_facts || "").trim();
   if (facts.length < 20) {
     return json(res, 400, { ok: false, error: "MISSING_FACTS", message: "Facts too short" });
@@ -239,7 +264,13 @@ module.exports = async (req, res) => {
     risk_scan: payload.input.risk_scan,
     situation_type: payload.input.situation_type,
     main_concerns: payload.input.main_concerns,
-    constraints: payload.input.constraints
+    constraints: payload.input.constraints,
+
+    // ✅ v3-native pass-through
+    continuity: payload.input.continuity,
+    happened_before: payload.input.happened_before,
+    exposure: payload.input.exposure,
+    leverage_flag: payload.input.leverage_flag
   });
 
   const controls = resolveFinalControls(payload, engine);
@@ -305,7 +336,7 @@ module.exports = async (req, res) => {
       ok: false,
       error: "MODEL_RETURNED_NON_JSON",
       message: "Model output was not valid JSON",
-      raw: mainText.slice(0, 1200)
+      raw: String(mainText || "").slice(0, 1200)
     });
   }
 
@@ -354,10 +385,8 @@ module.exports = async (req, res) => {
     // ✅ Prefer object for UI
     if (insightObj && typeof insightObj === "object") {
       out.insight = insightObj;
-      // keep a string version only for debugging (not required by UI)
       out.analysis_text = JSON.stringify(insightObj, null, 2);
     } else {
-      // fallback: keep as raw string if model misbehaves
       out.insight = { insight_title: "Strategic Insight", insight_sections: [], disclaimer_line: String(insightText || "") };
       out.analysis_text = String(insightText || "");
     }
