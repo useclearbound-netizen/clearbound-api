@@ -1,7 +1,10 @@
-const { compute } = require("./compute");
-const { fetchPrompt } = require("./promptLoader");
+// api/engine/index.js
+// Unified exports (fixes compute/export mismatch)
+
+const { computeEngineDecisions } = require("./compute");
+const { loadPrompt } = require("./promptLoader");
 
 module.exports = {
-  compute,
-  fetchPrompt
+  computeEngineDecisions,
+  loadPrompt
 };
